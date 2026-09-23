@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from app import DATE_COL, ID_COL, TIME_COL, VALUE_COL
-from inference.config import InferenceSettings
+from inference.config import InferenceSettings, pg_options
 from inference.service import build_service
 from inference.timeutil import to_model_fields
 from inference.weather import PgWeatherClient
@@ -54,13 +54,24 @@ def test_settings_overrides() -> None:
 
 
 def test_settings_require_pg_env() -> None:
-    env = {k: v for k, v in PG_ENV.items() if k != "PGPASSWORD"}
+    # Пароль может прийти из .pgpass/PGPASSFILE — он необязателен.
+    no_password = {k: v for k, v in PG_ENV.items() if k != "PGPASSWORD"}
+    InferenceSettings.from_env(no_password)
 
-    with pytest.raises(RuntimeError, match="PGPASSWORD"):
-        InferenceSettings.from_env(env)
+    no_host = {k: v for k, v in no_password.items() if k != "PGHOST"}
+    with pytest.raises(RuntimeError, match="PGHOST"):
+        InferenceSettings.from_env(no_host)
+    InferenceSettings.from_env({**no_host, "PGSERVICE": "goal"})
 
     with pytest.raises(ValueError):
         InferenceSettings.from_env({**PG_ENV, "HORIZON_HOURS": "0"})
+
+
+def test_pg_options_keep_pgoptions() -> None:
+    assert pg_options({}) == "-c statement_timeout=30s"
+    assert pg_options({"PGOPTIONS": "-c statement_timeout=5s"}) == (
+        "-c statement_timeout=30s -c statement_timeout=5s"
+    )
 
 
 def test_prediction_on_postgres_sources(pg, tmp_path: Path) -> None:

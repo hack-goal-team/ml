@@ -62,8 +62,9 @@ def pick_row(
         if row["is_forecast"] and row["valid_for"] == hour_utc:
             return row
 
-    # Текущий час поллер из hourly выкидывает и держит снимок current
-    # с valid_for, выровненным на 15 минут. Берём ближайший к началу часа.
+    # Запасной вариант: снимок current (valid_for выровнен на 15 минут),
+    # если hourly на текущий час нет — поллер до backend#47 его не хранил.
+    # Осадки в нём за 15 минут, а не за час; берём ближайший к началу часа.
     current = [row for row in rows if not row["is_forecast"]]
 
     return min(current, key=lambda row: row["valid_for"], default=None)
@@ -151,6 +152,7 @@ class PgWeatherClient:
         self.max_entries = max_entries
         self.clock = clock
         self._conn: psycopg.Connection | None = None
+        self._retry_at = float("-inf")
         self._cache: OrderedDict[
             datetime,
             tuple[float, WeatherFeatures],
@@ -189,6 +191,11 @@ class PgWeatherClient:
     ) -> WeatherFeatures:
         hour_utc = model_hour_to_utc(hour, self.tz)
 
+        # После сбоя не ходим в БД gap_ttl секунд: запрос идёт под локом
+        # PredictionService, и 8 часов по connect_timeout встали бы колом.
+        if self.clock() < self._retry_at:
+            return to_features(None)
+
         try:
             if self._conn is None or self._conn.closed:
                 self._conn = self.connect()
@@ -209,6 +216,7 @@ class PgWeatherClient:
             # Сбой БД — тот же пропуск (ADR-019), а не 503 на весь прогноз.
             log.warning("weather query failed hour=%s: %s", hour, exc)
             self._reset()
+            self._retry_at = self.clock() + self.gap_ttl_seconds
             return to_features(None)
 
         return to_features(pick_row(rows, hour_utc))

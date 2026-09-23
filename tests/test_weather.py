@@ -187,13 +187,35 @@ def test_core_cache_with_zero_entries_passes_through() -> None:
     assert len(calls) == 2
 
 
-def test_db_failure_is_gap_not_error() -> None:
+def test_db_failure_is_gap_and_backs_off() -> None:
+    clock = _Clock()
+    attempts = []
+
     def connect():
+        attempts.append(clock.now)
         raise psycopg.OperationalError("connection refused")
 
-    client = PgWeatherClient(connect=connect, district_id=1)
+    client = PgWeatherClient(
+        connect=connect,
+        district_id=1,
+        gap_ttl_seconds=60,
+        clock=clock,
+    )
+    base = datetime(2026, 9, 24, 14)
 
-    assert client.get(datetime(2026, 9, 24, 14)) == to_features(None)
+    # Все 8 смещений прогноза — одна попытка, а не 8 по connect_timeout.
+    for offset in (0, 1, 4, 8, 12, 16, 20, 24):
+        hour = base + timedelta(hours=offset)
+        assert client.get(hour) == to_features(None)
+    assert len(attempts) == 1
+
+    clock.now += 59
+    client.get(base + timedelta(hours=2))
+    assert len(attempts) == 1
+
+    clock.now += 2
+    client.get(base + timedelta(hours=3))
+    assert len(attempts) == 2
     client.close()
 
 
@@ -213,31 +235,33 @@ def test_reads_postgres_as_poller_writes(pg) -> None:
             "INSERT INTO districts VALUES "
             "(5773, 'Район', 55.75583, 37.61778), (1, 'Далеко', 59.9, 30.3)"
         )
-        # Заход поллера в 14:20 МСК: current на 14:15, прогноз с 15:00.
+        # Заход поллера в 14:20 МСК: current на 14:15 и hourly с 14:00
+        # (backend#47 хранит hourly и для текущего часа).
         _insert_weather(
             conn,
             [
                 {"valid_for": HOUR + timedelta(minutes=15),
                  "is_forecast": False, "temperature_c": Decimal("10.5"),
                  "weather_code": 3},
+                {"valid_for": HOUR,
+                 "is_forecast": True, "temperature_c": Decimal("10.00"),
+                 "weather_code": 2},
                 {"valid_for": HOUR + timedelta(hours=1),
                  "is_forecast": True, "temperature_c": Decimal("11.25"),
                  "weather_code": 61},
             ],
         )
-        assert resolve_district_id(conn, None) == 5773
 
     with pg.inference() as conn:
         assert resolve_district_id(conn, 7) == 7
-        # districts роли inference не выдан (004) — нужна явная настройка.
-        with pytest.raises(RuntimeError, match="WEATHER_DISTRICT_ID"):
-            resolve_district_id(conn, None)
+        assert resolve_district_id(conn, None) == 5773
 
     client = PgWeatherClient(connect=pg.inference, district_id=5773)
 
+    # Есть и current, и hourly на текущий час — побеждает hourly.
     current = client.get(datetime(2026, 9, 24, 14, 37))
-    assert current["temperature_2m (°C)"] == 10.5
-    assert current["weather_code (wmo code)"] == 3
+    assert current["temperature_2m (°C)"] == 10.0
+    assert current["weather_code (wmo code)"] == 2
 
     ahead = client.get(datetime(2026, 9, 24, 15))
     assert ahead["temperature_2m (°C)"] == 11.25
@@ -247,5 +271,20 @@ def test_reads_postgres_as_poller_writes(pg) -> None:
     # Прошлый час поллер удалил, будущий за горизонтом не пришёл.
     assert client.get(datetime(2026, 9, 24, 13)) == to_features(None)
     assert client.get(datetime(2026, 9, 26, 15)) == to_features(None)
-
     client.close()
+
+    with pg.admin() as conn:
+        conn.execute("DELETE FROM weather WHERE is_forecast AND valid_for = %s",
+                     (HOUR,))
+        conn.execute("REVOKE SELECT ON districts FROM inference")
+
+    # Hourly на текущий час нет — запасной вариант, снимок current.
+    fallback = PgWeatherClient(connect=pg.inference, district_id=5773)
+    assert fallback.get(datetime(2026, 9, 24, 14))[
+        "temperature_2m (°C)"
+    ] == 10.5
+    fallback.close()
+
+    with pg.inference() as conn:
+        with pytest.raises(RuntimeError, match="WEATHER_DISTRICT_ID"):
+            resolve_district_id(conn, None)

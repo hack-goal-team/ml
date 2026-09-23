@@ -12,8 +12,8 @@ import psycopg
 from app import ServiceConfig, normalize_horizon_hours
 
 # Подключение — стандартные переменные libpq, psycopg читает их сам.
-# PGPORT необязателен (5432), остальные проверяем, чтобы упасть внятно.
-REQUIRED_PG_ENV = ("PGHOST", "PGDATABASE", "PGUSER", "PGPASSWORD")
+# Пароль может прийти из PGPASSWORD, .pgpass/PGPASSFILE или PGSERVICE.
+REQUIRED_PG_ENV = ("PGHOST", "PGDATABASE", "PGUSER")
 
 # Без таймаутов оборванный сокет вешает execute навсегда (как в моке).
 CONNECT_KWARGS = dict(
@@ -22,8 +22,8 @@ CONNECT_KWARGS = dict(
     keepalives_idle=30,
     keepalives_interval=10,
     keepalives_count=3,
-    options="-c statement_timeout=30s",
 )
+STATEMENT_TIMEOUT = "-c statement_timeout=30s"
 
 
 def model_version(model_path: Path) -> str:
@@ -61,7 +61,7 @@ class InferenceSettings:
         env: Mapping[str, str] = os.environ,
     ) -> "InferenceSettings":
         missing = [name for name in REQUIRED_PG_ENV if not env.get(name)]
-        if missing:
+        if missing and not env.get("PGSERVICE"):
             raise RuntimeError(
                 f"Missing environment variables: {', '.join(missing)}"
             )
@@ -96,6 +96,16 @@ class InferenceSettings:
         )
 
 
+def pg_options(env: Mapping[str, str] = os.environ) -> str:
+    # Аргумент options перекрывает PGOPTIONS целиком, поэтому склеиваем;
+    # PGOPTIONS идёт последним, и его statement_timeout побеждает.
+    return f"{STATEMENT_TIMEOUT} {env.get('PGOPTIONS', '')}".strip()
+
+
 def connect() -> psycopg.Connection:
     """Подключение под ролью из PGUSER (inference, ADR-025)."""
-    return psycopg.connect(autocommit=True, **CONNECT_KWARGS)
+    return psycopg.connect(
+        autocommit=True,
+        options=pg_options(),
+        **CONNECT_KWARGS,
+    )

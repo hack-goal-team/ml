@@ -292,7 +292,7 @@ class WeatherSource(Protocol):
 class WeatherCache:
     def __init__(
         self,
-        client: WeatherServiceClient,
+        client: WeatherSource,
         max_entries: int,
     ) -> None:
         self.client = client

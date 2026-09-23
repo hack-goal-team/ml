@@ -32,22 +32,18 @@ OBJECT_COLUMNS = {
 
 TAG_FEATURE = "тег_инженерной_системы"
 
-# Последняя версия каждой строки — та же семантика, что у view
-# dim_*_current (ADR-031). Сами view роли inference не выданы (004).
+# Актуальная версия реестров — только через view (ADR-031).
+# Гранты роли inference на них выдаёт бэкенд (HACK-136).
 SELECT_CHANNELS = """
-    SELECT DISTINCT ON (channel_id)
-        channel_id, eng_system_type, sensor_type, system_tag,
+    SELECT channel_id, eng_system_type, sensor_type, system_tag,
         sensor_name, object_id
-    FROM dim_channels
-    ORDER BY channel_id, snapshot_at DESC
+    FROM dim_channels_current
 """
 
 SELECT_OBJECTS = """
-    SELECT DISTINCT ON (object_id)
-        object_id, hierarchy_level, parent_id, object_kind,
+    SELECT object_id, hierarchy_level, parent_id, object_kind,
         dispatcher_name
-    FROM dim_objects
-    ORDER BY object_id, snapshot_at DESC
+    FROM dim_objects_current
 """
 
 

@@ -1,6 +1,8 @@
 -- Выжимка схемы бэкенда (hack-goal-team/backend, db/changelog):
 -- 001-init-schema (dim_channels, dim_objects, districts, weather),
--- 013-weather-model-fields (6 колонок погоды), 004-inference-role (гранты).
+-- 005/012 (view dim_*_current), 013-weather-model-fields (6 колонок
+-- погоды), 004-inference-role (гранты). Гранты на view и districts
+-- бэкенд добавит в HACK-136.
 CREATE TABLE dim_channels (
     channel_id       integer     NOT NULL,
     snapshot_at      timestamptz NOT NULL,
@@ -47,6 +49,18 @@ CREATE TABLE weather (
     PRIMARY KEY (district_id, valid_for, is_forecast)
 );
 
+CREATE VIEW dim_channels_current AS
+SELECT DISTINCT ON (channel_id) *
+FROM dim_channels
+ORDER BY channel_id, snapshot_at DESC;
+
+CREATE VIEW dim_objects_current AS
+SELECT DISTINCT ON (object_id) *
+FROM dim_objects
+ORDER BY object_id, snapshot_at DESC;
+
 CREATE ROLE inference LOGIN;
 GRANT USAGE ON SCHEMA public TO inference;
 GRANT SELECT ON dim_channels, dim_objects, weather TO inference;
+GRANT SELECT ON dim_channels_current, dim_objects_current, districts
+    TO inference;

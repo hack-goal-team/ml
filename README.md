@@ -721,28 +721,28 @@ inference/
 
 В `PredictionService` добавлены два необязательных аргумента: `metadata_loader` и `weather_client`. Без них поведение прежнее.
 
-Справочники: берётся последняя версия каждой строки (`DISTINCT ON ... ORDER BY snapshot_at DESC`, как view `dim_*_current`). Результат совпадает с metadata из parquet по ключам, типам и значениям, это проверяют тесты на `data/*.parquet`.
+Справочники читаются через view `dim_channels_current` / `dim_objects_current` (ADR-031): последняя версия каждой строки. Результат совпадает с metadata из parquet по ключам, типам и значениям, это проверяют тесты на `data/*.parquet`.
 
 Погода на час модели `H` (МСК) переводится в UTC и ищется в `weather`:
 
 1. строка `is_forecast = true` с `valid_for = H`;
-2. иначе снимок `current` (`is_forecast = false`) с `valid_for` в `[H, H + 1 ч)` — для текущего часа поллер хранит только его;
+2. иначе снимок `current` (`is_forecast = false`) с `valid_for` в `[H, H + 1 ч)`. Это запасной вариант: поллер после backend#47 хранит hourly и для текущего часа;
 3. иначе все 10 полей `null`: модель получает NaN, `/predict` не падает (ADR-019).
 
-У `current` осадки за 15 минут, а не за час, — так их отдаёт источник.
+У `current` осадки за 15 минут, а не за час, как при обучении, — так их отдаёт источник. Поэтому он используется только при отсутствии hourly.
 
-Кеш: `WeatherCache` ядра держит час вечно, поэтому в этом режиме он выключен (`weather_cache_max_entries = 0`). Кеширует сам `PgWeatherClient`: найденный час живёт `WEATHER_TTL_SECONDS`, пропуск — `WEATHER_GAP_TTL_SECONDS`. Поллер обновляет погоду раз в час, и свежий прогноз подхватывается не позже чем через TTL.
+Кеш: `WeatherCache` ядра держит час вечно, поэтому в этом режиме он выключен (`weather_cache_max_entries = 0`). Кеширует сам `PgWeatherClient`: найденный час живёт `WEATHER_TTL_SECONDS`, пропуск — `WEATHER_GAP_TTL_SECONDS`. Поллер обновляет погоду раз в час, и свежий прогноз подхватывается не позже чем через TTL. После сбоя БД клиент `WEATHER_GAP_TTL_SECONDS` не переподключается и отдаёт пропуски: запрос идёт под локом `PredictionService`.
 
 Переменные окружения:
 
 | Переменная | Default | Описание |
 |---|---|---|
-| `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD` | `PGPORT=5432` | Стандартные переменные libpq, кроме `PGPORT` обязательны |
+| `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`, `PGSERVICE`, `PGPASSFILE`, `PGOPTIONS` | `PGPORT=5432` | Стандартные переменные libpq. `PGHOST`, `PGDATABASE`, `PGUSER` обязательны, если не задан `PGSERVICE`; пароль можно передать через `.pgpass`. `PGOPTIONS` дописывается после `statement_timeout=30s` и может его переопределить |
 | `ML_CONFIG` | `config.yml` | Конфиг ядра: модель, runtime, SHAP, логи |
 | `MODEL_PATH` | из `ML_CONFIG` | Путь к `.cbm` |
 | `MODEL_VERSION` | `catboost-aft-<12 hex sha256 .cbm>` | Значение `prediction_log.model_version` |
 | `HORIZON_HOURS` | `30` | Горизонт прогноза: 24 ч плюс запас на молчащий канал |
-| `WEATHER_DISTRICT_ID` | ближайший к `55.7558, 37.6173` | Район погоды. Модель обучена на одной точке в центре Москвы. Роли `inference` не выдан `SELECT` на `districts`, поэтому для неё район задаётся явно |
+| `WEATHER_DISTRICT_ID` | ближайший к `55.7558, 37.6173` | Район погоды. Модель обучена на одной точке в центре Москвы. Нужен `SELECT` на `districts` для роли `inference` (HACK-136), иначе район задаётся явно |
 | `WEATHER_TTL_SECONDS` | `300` | Сколько живёт найденный час погоды |
 | `WEATHER_GAP_TTL_SECONDS` | `60` | Сколько живёт час без данных |
 
