@@ -1,0 +1,3 @@
+-r requirements.txt
+# Встроенный Postgres для SQL-тестов inference/ без Docker.
+pgserver==0.1.4

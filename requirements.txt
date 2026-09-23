@@ -2,7 +2,9 @@
 catboost==1.2.10
 fastapi==0.141.1
 polars==1.42.1
+psycopg[binary]==3.3.6
 pytest==9.1.1
 PyYAML==6.0.3
 requests==2.34.2
+tzdata==2026.4
 uvicorn==0.53.0

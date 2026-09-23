@@ -705,6 +705,54 @@ python app.py \
 ```yaml
 weather_service.url
 ```
+
+## Inference из Postgres
+
+Режим для платформы (HACK-133): ядро `app.py` то же, но справочники и погода читаются из Postgres бэкенда под ролью `inference` (ADR-025), без parquet и без HTTP weather-service. Цикл по `events` и запись `prediction_log` — следующий шаг, здесь только источники данных.
+
+```text
+inference/
+  config.py     настройки из env, подключение к PG, model_version
+  reference.py  metadata из последних снапшотов dim_channels / dim_objects
+  weather.py    погода из таблицы weather, TTL-кеш, выбор района
+  timeutil.py   events.ts (timestamptz) <-> наивное время Europe/Moscow модели
+  service.py    build_service(): PredictionService на этих источниках
+```
+
+В `PredictionService` добавлены два необязательных аргумента: `metadata_loader` и `weather_client`. Без них поведение прежнее.
+
+Справочники: берётся последняя версия каждой строки (`DISTINCT ON ... ORDER BY snapshot_at DESC`, как view `dim_*_current`). Результат совпадает с metadata из parquet по ключам, типам и значениям, это проверяют тесты на `data/*.parquet`.
+
+Погода на час модели `H` (МСК) переводится в UTC и ищется в `weather`:
+
+1. строка `is_forecast = true` с `valid_for = H`;
+2. иначе снимок `current` (`is_forecast = false`) с `valid_for` в `[H, H + 1 ч)` — для текущего часа поллер хранит только его;
+3. иначе все 10 полей `null`: модель получает NaN, `/predict` не падает (ADR-019).
+
+У `current` осадки за 15 минут, а не за час, — так их отдаёт источник.
+
+Кеш: `WeatherCache` ядра держит час вечно, поэтому в этом режиме он выключен (`weather_cache_max_entries = 0`). Кеширует сам `PgWeatherClient`: найденный час живёт `WEATHER_TTL_SECONDS`, пропуск — `WEATHER_GAP_TTL_SECONDS`. Поллер обновляет погоду раз в час, и свежий прогноз подхватывается не позже чем через TTL.
+
+Переменные окружения:
+
+| Переменная | Default | Описание |
+|---|---|---|
+| `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD` | `PGPORT=5432` | Стандартные переменные libpq, кроме `PGPORT` обязательны |
+| `ML_CONFIG` | `config.yml` | Конфиг ядра: модель, runtime, SHAP, логи |
+| `MODEL_PATH` | из `ML_CONFIG` | Путь к `.cbm` |
+| `MODEL_VERSION` | `catboost-aft-<12 hex sha256 .cbm>` | Значение `prediction_log.model_version` |
+| `HORIZON_HOURS` | `30` | Горизонт прогноза: 24 ч плюс запас на молчащий канал |
+| `WEATHER_DISTRICT_ID` | ближайший к `55.7558, 37.6173` | Район погоды. Модель обучена на одной точке в центре Москвы. Роли `inference` не выдан `SELECT` на `districts`, поэтому для неё район задаётся явно |
+| `WEATHER_TTL_SECONDS` | `300` | Сколько живёт найденный час погоды |
+| `WEATHER_GAP_TTL_SECONDS` | `60` | Сколько живёт час без данных |
+
+Тесты: SQL-часть поднимает встроенный Postgres (`pgserver`) без Docker. Если пакета нет, эти тесты пропускаются.
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest -q
+```
+
 ---
 ---
 ---  

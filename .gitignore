@@ -1,1 +1,5 @@
 data/ext-journal-2026.parquet
+.venv/
+__pycache__/
+.pytest_cache/
+runtime/
