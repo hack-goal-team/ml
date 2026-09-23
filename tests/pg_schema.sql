@@ -64,3 +64,44 @@ GRANT USAGE ON SCHEMA public TO inference;
 GRANT SELECT ON dim_channels, dim_objects, weather TO inference;
 GRANT SELECT ON dim_channels_current, dim_objects_current, districts
     TO inference;
+
+-- Поток и прогнозы: 001 (events, prediction_log, decisions_on_prediction),
+-- 014 (prediction_log.shap), гранты 004. Партиция одна — DEFAULT.
+CREATE TABLE events (
+    id          bigint      GENERATED ALWAYS AS IDENTITY,
+    event_id    bigint      NOT NULL,
+    channel_id  integer     NOT NULL,
+    ts          timestamptz NOT NULL,
+    is_alarm    boolean     NOT NULL,
+    raw_value   text        NOT NULL,
+    PRIMARY KEY (id, ts),
+    UNIQUE (event_id, ts)
+) PARTITION BY RANGE (ts);
+CREATE TABLE events_default PARTITION OF events DEFAULT;
+
+CREATE TABLE reason_codes (
+    code         text PRIMARY KEY,
+    description  text NOT NULL
+);
+
+CREATE TABLE prediction_log (
+    prediction_id   bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    target_kind     text        NOT NULL,
+    target_ref      text        NOT NULL,
+    incident_type   text        NOT NULL,
+    probability     numeric(5,4) NOT NULL CHECK (probability BETWEEN 0 AND 1),
+    horizon_until   timestamptz NOT NULL,
+    computed_at     timestamptz NOT NULL DEFAULT now(),
+    model_version   text        NOT NULL,
+    shap            jsonb
+);
+
+CREATE TABLE decisions_on_prediction (
+    decision_id    bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    prediction_id  bigint      NOT NULL REFERENCES prediction_log,
+    reason_code    text        NOT NULL REFERENCES reason_codes,
+    decided_by     text        NOT NULL
+);
+
+GRANT SELECT ON events, decisions_on_prediction TO inference;
+GRANT SELECT, INSERT, DELETE ON prediction_log TO inference;
