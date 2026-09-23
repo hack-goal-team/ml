@@ -1,0 +1,8 @@
+# Python 3.11.15
+catboost==1.2.10
+fastapi==0.141.1
+polars==1.42.1
+pytest==9.1.1
+PyYAML==6.0.3
+requests==2.34.2
+uvicorn==0.53.0

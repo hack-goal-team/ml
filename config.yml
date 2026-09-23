@@ -1,0 +1,54 @@
+api:
+  # Адрес, на котором prediction-сервис принимает HTTP-запросы.
+  host: "0.0.0.0"
+
+  # Порт prediction-сервиса.
+  port: 8000
+
+model:
+  # Путь к CatBoost SurvivalAft модели.
+  path: "data/best_model.cbm"
+
+metadata:
+  # Справочник каналов датчиков.
+  sensors_path: "data/справочник_каналов_датчиков.parquet"
+
+  # Справочник объектов.
+  objects_path: "data/справочник_объектов_диспетчер.parquet"
+
+runtime:
+  # Кеш объединённой metadata; создаётся автоматически, если файла нет.
+  metadata_cache_path: "runtime/metadata_cache.pkl"
+
+  # Snapshot rolling-state для восстановления после рестарта.
+  state_path: "runtime/feature_state.pkl"
+
+  # Файл логов prediction-сервиса.
+  log_path: "runtime/service.log"
+
+  # Автосохранение state каждые N прогнозов; 0 отключает.
+  state_save_every_n: 0
+
+shap:
+  # В режиме auto SHAP считается только при probability > этого порога.
+  auto_threshold: 0.50
+
+weather_service:
+  # Внутренняя ручка погодного сервиса.
+  url: "http://127.0.0.1:8010/weather"
+
+  # Максимальное ожидание ответа погодного сервиса в секундах.
+  timeout_seconds: 5.0
+
+  # Таймзона, которую prediction-сервис передаёт погодному сервису.
+  timezone: "Europe/Moscow"
+
+  # Максимальное число уже полученных погодных часов в RAM-кеше.
+  cache_max_entries: 256
+
+logging:
+  # Максимальный размер одного log-файла до ротации.
+  max_bytes: 52428800
+
+  # Число старых log-файлов после ротации.
+  backup_count: 3
