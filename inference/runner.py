@@ -23,6 +23,7 @@ from app import PredictionService
 from inference.config import InferenceSettings
 from inference.config import connect as pg_connect
 from inference.cursor import EventCursor
+from inference.health import HEARTBEAT_FILE, READY_FILE
 from inference.predictions import (
     PredictionRow,
     delete_expired,
@@ -37,8 +38,6 @@ from inference.timeutil import to_model_fields, to_model_time
 log = logging.getLogger("inference")
 
 CURSOR_FILE = "events_cursor.json"
-HEARTBEAT_FILE = "heartbeat"
-READY_FILE = "ready"
 
 SELECT_MAX_ID = "SELECT coalesce(max(id), 0) FROM events"
 

@@ -10,7 +10,10 @@ import sys
 import time
 from pathlib import Path
 
-from inference.runner import HEARTBEAT_FILE, READY_FILE
+# Здесь, а не в runner: healthcheck не должен импортировать catboost
+# и ядро на каждый запуск раз в 30 секунд.
+HEARTBEAT_FILE = "heartbeat"
+READY_FILE = "ready"
 
 
 def check(
