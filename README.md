@@ -787,6 +787,38 @@ Healthcheck `python -m inference.health`: при старте процесса `
 | `METADATA_RETRY_SECONDS` | `600` | Минимальный интервал перечитывания из-за неизвестного канала |
 | `HEALTH_MAX_AGE_SECONDS` | `120` | Допустимый возраст heartbeat |
 
+### Docker и деплой
+
+Образ (`Dockerfile`): `python:3.11-slim`, пользователь `inference` (uid 10001). Внутри только `app.py`, `config.yml`, `inference/` и `data/best_model.cbm`, parquet-журнал в образ не попадает. `CMD python -m inference.runner`, `HEALTHCHECK python -m inference.health` с `start-period` 10 мин на прогрев.
+
+```bash
+docker build -t inference:local .
+docker run --rm -v inference-runtime:/app/runtime \
+  -e PGHOST=... -e PGDATABASE=goal -e PGUSER=inference -e PGPASSWORD=... \
+  inference:local
+```
+
+Volume монтируется в `/app/runtime` (`INFERENCE_RUNTIME_DIR`): там курсор `events_cursor.json`, `heartbeat`, `ready` и `service.log`. Без volume каждый рестарт — первый запуск с `max(id)`: логи, пришедшие за время простоя, не спрогнозируются.
+
+CI (`.github/workflows/ci.yml`, на PR и push в `main`): `pytest` со встроенным Postgres (пропуск SQL-тестов считается провалом), `docker build` и smoke-проверка образа.
+
+Деплой (`.github/workflows/deploy.yml`) идёт автоматически на push в `main` и вручную через `workflow_dispatch`:
+
+1. Собирается `inference:<sha>` и едет на VPS по SSH: `docker save | gzip | ssh | docker load`.
+2. Образ тегается `inference:current`. Три последних `inference:<sha>` остаются для отката: `docker tag inference:<sha> inference:current` и `docker compose up -d --no-deps inference`.
+3. Если в `~/backend/compose.yaml` есть сервис `inference`, он перезапускается через `docker compose up -d --no-deps inference`, и деплой ждёт `healthy` до 15 мин. На ошибке печатаются логи. Если сервиса нет, образ только загружается, и workflow пишет notice.
+
+Тег не хранится в `~/backend/.env`: деплой бэкенда переписывает этот файл целиком. Поэтому compose бэкенда ссылается на `image: inference:current`.
+
+Секреты репозитория: `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`, те же, что у бэкенда. Без них workflow сразу падает с `::error::`. Пароль роли `inference` лежит в `.env` бэкенда, этому репо он не нужен.
+
+Порядок первого запуска:
+
+1. Мержится и деплоится HACK-136 в бэкенде: сервис `inference` в compose, volume, гранты на `dim_*_current` и `districts`.
+2. Затем деплоится этот репо.
+
+Раньше образ безвреден: он просто лежит на VPS.
+
 Тесты: SQL-часть поднимает встроенный Postgres (`pgserver`) без Docker. Если пакета нет, эти тесты пропускаются.
 
 ```bash

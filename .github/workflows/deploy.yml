@@ -1,0 +1,117 @@
+name: Deploy inference
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Два деплоя подряд не должны грузить и перезапускать образ параллельно.
+concurrency:
+  group: deploy-inference
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      IMAGE: inference:${{ github.sha }}
+      REMOTE_DIR: backend
+    steps:
+      # Без секретов ssh ждал бы ввода или падал невнятно — валимся сразу.
+      - name: Check secrets
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          missing=""
+          [ -n "$VPS_HOST" ] || missing="$missing VPS_HOST"
+          [ -n "$VPS_USER" ] || missing="$missing VPS_USER"
+          [ -n "$VPS_SSH_KEY" ] || missing="$missing VPS_SSH_KEY"
+          if [ -n "$missing" ]; then
+            echo "::error::repository secrets are not set:$missing"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t "$IMAGE" .
+
+      - name: Configure SSH
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$VPS_SSH_KEY" > ~/.ssh/id_vps
+          chmod 600 ~/.ssh/id_vps
+          ssh-keyscan -T 15 -H "$VPS_HOST" >> ~/.ssh/known_hosts
+          cat >> ~/.ssh/config <<EOF
+          Host vps
+            HostName $VPS_HOST
+            User $VPS_USER
+            IdentityFile ~/.ssh/id_vps
+            IdentitiesOnly yes
+            ServerAliveInterval 30
+            ConnectTimeout 20
+            BatchMode yes
+          EOF
+
+      # Образ едет по SSH, как у бэкенда: реестр на VPS не нужен.
+      - name: Upload image
+        run: |
+          set -o pipefail
+          docker save "$IMAGE" | gzip | ssh vps 'gunzip | sudo -n docker load'
+
+      # Стабильный тег, а не переменная в .env: деплой бэкенда переписывает
+      # ~/backend/.env целиком. inference:<sha> остаются для отката.
+      - name: Tag current
+        run: |
+          ssh vps "SHA=${{ github.sha }} bash -s" <<'EOF'
+          set -euo pipefail
+          sudo -n docker tag "inference:$SHA" inference:current
+          # Храним три последних sha; image prune бэкенда их не трогает.
+          sudo -n docker image ls inference --format '{{.Tag}} {{.CreatedAt}}' \
+            | grep -Ev '^(current|<none>) ' | sort -k2 -r | awk 'NR > 3 {print $1}' \
+            | while read -r tag; do sudo -n docker image rm "inference:$tag" || true; done
+          EOF
+
+      - name: Restart service
+        run: |
+          ssh vps "REMOTE_DIR=$REMOTE_DIR bash -s" <<'EOF'
+          set -euo pipefail
+          cd "$HOME/$REMOTE_DIR" 2>/dev/null || {
+            echo "::notice::~/$REMOTE_DIR is missing: image loaded, nothing to restart"
+            exit 0
+          }
+          services=$(sudo -n docker compose config --services) || {
+            echo "::error::docker compose config failed in ~/$REMOTE_DIR"
+            exit 1
+          }
+          # Сервис и гранты добавляет бэкенд (HACK-136). До него образ
+          # просто лежит на VPS и ничего не запускает.
+          if ! grep -qx inference <<<"$services"; then
+            echo "::notice::backend compose has no 'inference' service yet (HACK-136): image loaded, not started"
+            exit 0
+          fi
+          sudo -n docker compose up -d --no-deps inference
+
+          # Прогрев окон за 3 дня — минуты; ждём healthy, а не running.
+          deadline=$((SECONDS + 900))
+          while :; do
+            id=$(sudo -n docker compose ps -q inference)
+            status=$(sudo -n docker inspect -f '{{.State.Health.Status}}' "$id" 2>/dev/null || echo missing)
+            echo "inference: $status"
+            [ "$status" = healthy ] && break
+            if [ "$status" = unhealthy ] || [ $SECONDS -ge $deadline ]; then
+              echo "::error::inference is not healthy ($status)"
+              sudo -n docker compose logs --tail 200 inference
+              exit 1
+            fi
+            sleep 15
+          done
+          sudo -n docker compose logs --tail 20 inference
+          EOF

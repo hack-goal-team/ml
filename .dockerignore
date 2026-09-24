@@ -1,0 +1,13 @@
+# Образ собирается из белого списка в Dockerfile; сюда — то, что
+# не должно даже уходить в контекст сборки.
+.git
+.github
+.venv
+.pytest_cache
+.ruff_cache
+**/__pycache__
+runtime
+data/*.parquet
+tests
+test_app.py
+demo.py
