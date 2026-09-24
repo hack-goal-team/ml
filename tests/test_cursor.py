@@ -32,16 +32,19 @@ def test_cursor_keeps_rescan_window_for_lag() -> None:
     assert (cursor.low, cursor.seen) == (105, set())
 
 
-def test_cursor_ignores_ids_below_low_and_caps_seen() -> None:
+def test_cursor_ignores_ids_below_low_and_caps_seen(caplog) -> None:
     cursor = EventCursor(low=10, lag_seconds=300, max_seen=3)
     cursor.mark(5)
     assert not cursor.dirty
 
     for event_id in (11, 12, 13, 14, 15):
         cursor.mark(event_id)
-    cursor.advance(now=0)
+    with caplog.at_level("WARNING", logger="inference.cursor"):
+        cursor.advance(now=0)
 
     assert (cursor.low, cursor.seen) == (12, {13, 14, 15})
+    # Сдвиг low раньше лага — возможная потеря, она обязана быть в логе.
+    assert "low 10 -> 12 before lag" in caplog.text
 
 
 def test_cursor_roundtrip(tmp_path: Path) -> None:

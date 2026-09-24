@@ -1,11 +1,15 @@
 """Позиция чтения events, устойчивая к коммитам не по порядку id."""
 from __future__ import annotations
 
+import heapq
 import json
+import logging
 import os
 from collections import deque
 from pathlib import Path
 from typing import Iterable
+
+log = logging.getLogger("inference.cursor")
 
 
 class EventCursor:
@@ -49,9 +53,18 @@ class EventCursor:
         while self._history and self._history[0][0] <= now - self.lag_seconds:
             low = max(low, self._history.popleft()[1])
 
-        # Предохранитель памяти: при лавине строк держим max_seen старших.
-        if len(self.seen) > self.max_seen:
-            low = max(low, sorted(self.seen)[-self.max_seen - 1])
+        # Предохранитель памяти при лавине строк: держим max_seen старших.
+        # Id ниже нового low, ещё не закоммиченные, так будут потеряны.
+        excess = len(self.seen) - self.max_seen
+        if excess > 0:
+            evicted = heapq.nsmallest(excess, self.seen)[-1]
+            if evicted > low:
+                log.warning(
+                    "cursor seen cap %d hit: low %d -> %d before lag, "
+                    "late commits below it are lost", self.max_seen, low,
+                    evicted,
+                )
+                low = evicted
 
         if low > self.low:
             self.low = low
@@ -63,7 +76,7 @@ class EventCursor:
         tmp = path.with_name(path.name + ".tmp")
 
         with tmp.open("w", encoding="utf-8") as file:
-            json.dump({"low": self.low, "seen": sorted(self.seen)}, file)
+            json.dump({"low": self.low, "seen": list(self.seen)}, file)
             file.flush()
             os.fsync(file.fileno())
 

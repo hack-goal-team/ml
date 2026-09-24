@@ -338,3 +338,40 @@ def test_cursor_ahead_of_database_is_reset(db, make_runner) -> None:
     runner.tick(conn)
 
     assert len(predictions(db)) == 1
+
+
+def test_broken_shap_is_counted_not_skipped(db, make_runner, monkeypatch) -> None:
+    runner, conn = started(make_runner, db, threshold=0.0)
+
+    def broken(shap, cat_features):
+        raise KeyError("probability_delta_from_component")
+
+    monkeypatch.setattr("inference.runner.shap_contract", broken)
+    with db.admin() as admin:
+        add_event(admin, CHANNEL, datetime.now(timezone.utc))
+    runner.tick(conn)
+
+    # Сбой сборки строки — не «неизвестный канал» и не 409.
+    tick = runner.last_tick
+    assert (tick.failed_write_prep, tick.skipped_unknown, tick.predicted) == (
+        1, 0, 0,
+    )
+    assert predictions(db) == []
+
+
+def test_run_clears_stale_health_files(db, make_runner) -> None:
+    runner = make_runner()
+    runner.options.runtime_dir.mkdir(parents=True)
+    for name in ("ready", "heartbeat"):
+        runner.path(name).touch()
+
+    # БД недоступна: старые файлы volume не должны делать health зелёным.
+    def down() -> psycopg.Connection:
+        runner.stop_event.set()
+        raise psycopg.OperationalError("connection refused")
+
+    runner.connect = down
+    runner.run()
+
+    assert not runner.path("ready").exists()
+    assert not runner.path("heartbeat").exists()

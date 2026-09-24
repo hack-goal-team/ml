@@ -105,10 +105,20 @@ class TickCounters:
     skipped_ooo: int = 0
     skipped_unknown: int = 0
     failed: int = 0
+    failed_write_prep: int = 0
     shap: int = 0
     expired: int = 0
     write_ms: float = 0.0
     lag_seconds: float | None = None
+    ticks: int = 0
+
+    def add(self, other: "TickCounters") -> None:
+        # Сумма за окно лога; lag — последнего такта с данными.
+        for name in self.__dataclass_fields__:
+            if name != "lag_seconds":
+                setattr(self, name, getattr(self, name) + getattr(other, name))
+        if other.lag_seconds is not None:
+            self.lag_seconds = other.lag_seconds
 
 
 @dataclass(slots=True, frozen=True)
@@ -154,7 +164,10 @@ class Runner:
         self.window = timedelta(hours=72)
         self._metadata_at = 0.0
         self._ttl_at = float("-inf")
-        self._idle_logged_at = float("-inf")
+        self.totals = TickCounters()
+        self.last_tick = TickCounters()
+        self._logged_at = float("-inf")
+        self._traceback_at = float("-inf")
 
     def path(self, name: str) -> Path:
         return self.options.runtime_dir / name
@@ -218,7 +231,7 @@ class Runner:
         params = {
             "since": self.clock() - self.window,
             "low": cursor.low,
-            "seen": sorted(cursor.seen),
+            "seen": list(cursor.seen),
         }
 
         def payloads() -> Iterator[dict[str, Any]]:
@@ -246,7 +259,7 @@ class Runner:
     def tick(self, conn: psycopg.Connection) -> bool:
         """Один проход; True — страница полная, читать дальше без паузы."""
         assert self.service is not None and self.cursor is not None
-        counters = TickCounters()
+        counters = TickCounters(ticks=1)
 
         # Прогнозы прошлого такта, не записанные из-за сбоя БД.
         counters.write_ms += self._flush(conn)
@@ -278,6 +291,7 @@ class Runner:
         if self.cursor.dirty:
             self.cursor.save(self.path(CURSOR_FILE))
 
+        self.last_tick = counters
         self._log_tick(counters)
         return len(events) >= self.options.batch_size
 
@@ -288,7 +302,7 @@ class Runner:
             {
                 "since": self.clock() - self.window,
                 "low": self.cursor.low,
-                "seen": sorted(self.cursor.seen),
+                "seen": list(self.cursor.seen),
                 "limit": self.options.batch_size,
             },
         ).fetchall()
@@ -344,15 +358,6 @@ class Runner:
                     "add_shap": "auto",
                 }
             )
-            shap = result.get("shap")
-            row = PredictionRow(
-                channel_id=event.channel_id,
-                probability=to_probability(result["probability"]),
-                horizon_until=horizon_until,
-                shap=None if shap is None else shap_contract(
-                    shap, self._cat_features(service)
-                ),
-            )
         except KeyError:
             counters.skipped_unknown += 1
             return
@@ -362,13 +367,38 @@ class Runner:
             return
         except Exception:  # noqa: BLE001
             # Битая строка не должна крутить рестарты: считаем и идём дальше.
-            log.exception("predict failed event_id=%d", event.id)
+            self._log_failure("predict", event.id)
             counters.failed += 1
+            return
+
+        # Отдельно от predict: сломанный формат ответа ядра (NaN, новое
+        # имя ключа shap) — наш сбой, а не пропуск unknown/ooo.
+        try:
+            shap = result.get("shap")
+            row = PredictionRow(
+                channel_id=event.channel_id,
+                probability=to_probability(result["probability"]),
+                horizon_until=horizon_until,
+                shap=None if shap is None else shap_contract(
+                    shap, self._cat_features(service)
+                ),
+            )
+        except Exception:  # noqa: BLE001
+            self._log_failure("write_prep", event.id)
+            counters.failed_write_prep += 1
             return
 
         self.pending.append(row)
         counters.predicted += 1
         counters.shap += row.shap is not None
+
+    def _log_failure(self, stage: str, event_id: int) -> None:
+        # Traceback раз в минуту: при системной поломке он был бы на
+        # каждом логе. Остальные случаи видны счётчиками в строке tick.
+        now = self.monotonic()
+        if now - self._traceback_at >= 60:
+            self._traceback_at = now
+            log.exception("%s failed event_id=%d", stage, event_id)
 
     @staticmethod
     def _cat_features(service: PredictionService) -> frozenset[str]:
@@ -399,18 +429,20 @@ class Runner:
         log.info("metadata_reloaded reason=%s channels=%d", reason, len(metadata))
 
     def _log_tick(self, counters: TickCounters) -> None:
-        busy = counters.read or counters.expired or counters.write_ms
+        # Одна строка в минуту с суммой за окно: при 2 лог/с почти каждый
+        # такт с данными, и построчный лог дал бы 43 тыс. строк в сутки.
+        self.totals.add(counters)
         now = self.monotonic()
-
-        # Пустые такты — раз в минуту, иначе 43 тыс. строк в сутки.
-        if not busy and now - self._idle_logged_at < 60:
+        if now - self._logged_at < 60:
             return
 
-        self._idle_logged_at = now
-        data = asdict(counters)
+        self._logged_at = now
+        data = asdict(self.totals)
+        data["write_ms"] = round(data["write_ms"], 1)
         assert self.cursor is not None
         data.update(low=self.cursor.low, seen=len(self.cursor.seen))
         log.info("tick %s", " ".join(f"{k}={v}" for k, v in data.items()))
+        self.totals = TickCounters()
 
     # --- жизненный цикл ------------------------------------------------
 
@@ -420,6 +452,12 @@ class Runner:
     def run(self) -> None:
         conn: psycopg.Connection | None = None
         backoff = 1.0
+
+        # runtime/ — volume: файлы прошлого контейнера сделали бы health
+        # зелёным, пока этот ещё не подключился к БД.
+        self.options.runtime_dir.mkdir(parents=True, exist_ok=True)
+        for name in (READY_FILE, HEARTBEAT_FILE):
+            self.path(name).unlink(missing_ok=True)
 
         while not self.stop_event.is_set():
             try:
