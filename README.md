@@ -800,9 +800,9 @@ docker run --rm -v inference-runtime:/app/runtime \
 
 Volume монтируется в `/app/runtime` (`INFERENCE_RUNTIME_DIR`): там курсор `events_cursor.json`, `heartbeat`, `ready` и `service.log`. Без volume каждый рестарт — первый запуск с `max(id)`: логи, пришедшие за время простоя, не спрогнозируются.
 
-CI (`.github/workflows/ci.yml`, на PR и push в `main`): `pytest` со встроенным Postgres (пропуск SQL-тестов считается провалом), `docker build` и smoke-проверка образа.
+CI (`.github/workflows/ci.yml`, на PR и вызовом из деплоя): `pytest` со встроенным Postgres (пропуск SQL-тестов считается провалом), `docker build` и smoke-проверка образа.
 
-Деплой (`.github/workflows/deploy.yml`) идёт автоматически на push в `main` и вручную через `workflow_dispatch`:
+Деплой (`.github/workflows/deploy.yml`) идёт автоматически на push в `main` и вручную через `workflow_dispatch`. Сначала job `test` вызывает `ci.yml`, и выкладка стартует, только если тесты и сборка образа зелёные:
 
 1. Собирается `inference:<sha>` и едет на VPS по SSH: `docker save | gzip | ssh | docker load`.
 2. Образ тегается `inference:current`. Три последних `inference:<sha>` остаются для отката: `docker tag inference:<sha> inference:current` и `docker compose up -d --no-deps inference`.
@@ -812,12 +812,13 @@ CI (`.github/workflows/ci.yml`, на PR и push в `main`): `pytest` со вст
 
 Секреты репозитория: `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`, те же, что у бэкенда. Без них workflow сразу падает с `::error::`. Пароль роли `inference` лежит в `.env` бэкенда, этому репо он не нужен.
 
-Порядок первого запуска:
+Порядок первого запуска безопасен в обе стороны. Бэкенд (HACK-136) описывает сервис как `image: inference:current` с `pull_policy: never` и поднимает его, только если такой образ уже есть на VPS. Там же volume `/app/runtime` и гранты на `dim_*_current` и `districts`.
 
-1. Мержится и деплоится HACK-136 в бэкенде: сервис `inference` в compose, volume, гранты на `dim_*_current` и `districts`.
-2. Затем деплоится этот репо.
+1. Задать секреты этого репо: `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`.
+2. Деплой этого репо (мерж в `main` или `workflow_dispatch`) загружает `inference:current`. Если compose бэкенда уже определяет сервис `inference`, он сразу запускается, и деплой ждёт `healthy`. Если не определяет, образ просто лежит на VPS.
+3. Деплой бэкенда с HACK-136 поднимает сервис, если он ещё не запущен.
 
-Раньше образ безвреден: он просто лежит на VPS.
+Если бэкенд задеплоен раньше образа, его деплой проходит без `inference`: `pull_policy: never` не даёт compose идти за образом в Docker Hub. Сервис поднимет шаг 2.
 
 Тесты: SQL-часть поднимает встроенный Postgres (`pgserver`) без Docker. Если пакета нет, эти тесты пропускаются.
 

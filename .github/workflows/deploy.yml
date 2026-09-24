@@ -10,8 +10,16 @@ concurrency:
   group: deploy-inference
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
+  # Без зелёных тестов и сборки образа на VPS ничего не едет.
+  test:
+    uses: ./.github/workflows/ci.yml
+
   deploy:
+    needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 40
     env:
