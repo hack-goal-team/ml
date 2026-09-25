@@ -760,6 +760,17 @@ Healthcheck `python -m inference.health`: флаг `ready` после прогр
 
 Env (default): `INFERENCE_RUNTIME_DIR` (`runtime`, volume), `POLL_INTERVAL_SECONDS` (2), `EVENTS_BATCH_SIZE` (5000), `EVENTS_REORDER_LAG_SECONDS` (300), `TTL_INTERVAL_SECONDS` (60), `METADATA_REFRESH_SECONDS` (3600), `METADATA_RETRY_SECONDS` (600), `HEALTH_MAX_AGE_SECONDS` (120).
 
+### Docker и деплой
+
+Образ: `python:3.11-slim`, `CMD python -m inference.runner`, `HEALTHCHECK python -m inference.health` (прогрев до 10 мин). Volume `/app/runtime` хранит курсор, без него рестарт теряет логи за простой.
+
+```bash
+docker build -t inference:local .
+docker run --rm -v inference-runtime:/app/runtime -e PGHOST=... -e PGUSER=inference -e PGPASSWORD=... inference:local
+```
+
+CI (`ci.yml`): `pytest` со встроенным Postgres, `docker build`, smoke образа. Деплой (`deploy.yml`, push в `main` или вручную): после CI образ едет на VPS по SSH как `inference:current`, три прошлых `inference:<sha>` остаются для отката. Если в compose бэкенда есть сервис `inference`, он перезапускается и деплой ждёт `healthy`. Секреты: `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`.
+
 Тесты: SQL-часть поднимает встроенный Postgres (`pgserver`) без Docker. Если пакета нет, эти тесты пропускаются.
 
 ```bash

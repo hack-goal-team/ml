@@ -1,0 +1,48 @@
+name: CI
+
+# main проверяет deploy.yml, вызывая этот workflow до выкладки.
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Install
+        run: pip install -r requirements-dev.txt
+
+      # SQL-тесты молча пропускаются без pgserver; в CI пропуск — провал.
+      - name: Test
+        run: python -m pytest -q -rs | tee pytest.log && ! grep -q SKIPPED pytest.log
+        shell: bash -o pipefail {0}
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t inference:ci .
+
+      # Импорт цикла ловит нехватку файлов и зависимостей в образе;
+      # healthcheck до старта обязан быть красным.
+      - name: Smoke
+        run: |
+          docker run --rm inference:ci python -c "import inference.runner"
+          docker run --rm inference:ci id -u | grep -qx 10001
+          if docker run --rm inference:ci python -m inference.health; then
+            echo "::error::healthcheck is green before startup"
+            exit 1
+          fi
