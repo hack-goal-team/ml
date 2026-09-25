@@ -708,7 +708,7 @@ weather_service.url
 
 ## Inference из Postgres
 
-Режим для платформы (HACK-133): ядро `app.py` то же, но справочники и погода читаются из Postgres бэкенда под ролью `inference` (ADR-025), без parquet и без HTTP weather-service. Цикл по `events` и запись `prediction_log` — следующий шаг, здесь только источники данных.
+Режим для платформы (HACK-133): ядро `app.py` то же, но справочники и погода читаются из Postgres бэкенда под ролью `inference` (ADR-025), без parquet и без HTTP weather-service. Цикл `inference.runner` читает новые строки `events` и пишет прогнозы в `prediction_log`.
 
 ```text
 inference/
@@ -717,6 +717,8 @@ inference/
   weather.py    погода из таблицы weather, TTL-кеш, выбор района
   timeutil.py   events.ts (timestamptz) <-> наивное время Europe/Moscow модели
   service.py    build_service(): PredictionService на этих источниках
+  runner.py     цикл events -> prediction_log
+  cursor.py     позиция чтения events
 ```
 
 В `PredictionService` добавлены два необязательных аргумента: `metadata_loader` и `weather_client`. Без них поведение прежнее.
@@ -745,6 +747,18 @@ inference/
 | `WEATHER_DISTRICT_ID` | ближайший к `55.7558, 37.6173` | Район погоды. Модель обучена на одной точке в центре Москвы. Нужен `SELECT` на `districts` для роли `inference` (HACK-136), иначе район задаётся явно |
 | `WEATHER_TTL_SECONDS` | `300` | Сколько живёт найденный час погоды |
 | `WEATHER_GAP_TTL_SECONDS` | `60` | Сколько живёт час без данных |
+
+### Цикл `python -m inference.runner`
+
+Старт: прогрев окон из `events` за 72 ч, pickle ядра не используется. Такт: новые строки `events` пачкой → один прогноз на лог (`channel`, `CHANNEL_EVENT`, `horizon_until = ts + 30 ч`) → запись пачки одной транзакцией. TTL удаляет истёкшие `catboost-aft-*` без решения диспетчера. Обрыв БД — reconnect с backoff.
+
+Пропуски и сбои считаются в строке `tick` раз в минуту: `skipped_stale`, `skipped_ooo`, `skipped_unknown`, `failed`, `failed_write_prep`.
+
+Курсор (`cursor.py`) читает `id > low AND id NOT IN seen`, чтобы не терять поздние коммиты меньшего id. `low` отстаёт на `EVENTS_REORDER_LAG_SECONDS`, транзакция дольше лага теряет строки. Хранится в `runtime/events_cursor.json` после COMMIT: at-least-once.
+
+Healthcheck `python -m inference.health`: флаг `ready` после прогрева и свежий `heartbeat`.
+
+Env (default): `INFERENCE_RUNTIME_DIR` (`runtime`, volume), `POLL_INTERVAL_SECONDS` (2), `EVENTS_BATCH_SIZE` (5000), `EVENTS_REORDER_LAG_SECONDS` (300), `TTL_INTERVAL_SECONDS` (60), `METADATA_REFRESH_SECONDS` (3600), `METADATA_RETRY_SECONDS` (600), `HEALTH_MAX_AGE_SECONDS` (120).
 
 Тесты: SQL-часть поднимает встроенный Postgres (`pgserver`) без Docker. Если пакета нет, эти тесты пропускаются.
 
