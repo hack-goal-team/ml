@@ -717,10 +717,8 @@ inference/
   weather.py    погода из таблицы weather, TTL-кеш, выбор района
   timeutil.py   events.ts (timestamptz) <-> наивное время Europe/Moscow модели
   service.py    build_service(): PredictionService на этих источниках
-  runner.py     цикл: прогрев, чтение events, predict, запись, TTL
-  cursor.py     позиция чтения events (watermark) на volume
-  predictions.py строка prediction_log и формат shap (014)
-  health.py     healthcheck контейнера
+  runner.py     цикл events -> prediction_log
+  cursor.py     позиция чтения events
 ```
 
 В `PredictionService` добавлены два необязательных аргумента: `metadata_loader` и `weather_client`. Без них поведение прежнее.
@@ -752,40 +750,15 @@ inference/
 
 ### Цикл `python -m inference.runner`
 
-1. Старт: `build_service`, затем прогрев rolling-state из `events` за последние 72 ч (самое длинное окно модели) в порядке `ts, id`. Источник правды — Postgres: pickle-state ядра в этом режиме не читается и не пишется (`state_path` указывает в пустой временный каталог).
-2. Такт раз в `POLL_INTERVAL_SECONDS`: новые строки `events` пачкой до `EVENTS_BATCH_SIZE`, обработка в порядке `ts, id`, запись всех прогнозов пачки одной транзакцией.
-3. На каждый лог один прогноз: `target_kind='channel'`, `target_ref=channel_id`, `incident_type='CHANNEL_EVENT'`, `horizon_until = ts + HORIZON_HOURS`, `probability` округлена до `numeric(5,4)`, `shap` по контракту 014 только при `probability > shap.auto_threshold`, иначе `NULL`.
-4. Пропуски со счётчиками в строке `tick`. Она пишется раз в минуту с суммой за минуту, поле `ticks` — число тактов в ней:
-   - `skipped_stale`: `ts + горизонт < now`, прогноз родился бы истёкшим. Лог всё равно идёт в окна канала, если он не старше окна и не нарушает порядок. Строки старше 72 ч не читаются вовсе (импорт истории);
-   - `skipped_ooo`: лог старше уже учтённого по каналу (в API это 409);
-   - `skipped_unknown`: канала нет в реестре. Реестр перечитывается не чаще раза в `METADATA_RETRY_SECONDS`, а плановое обновление идёт раз в `METADATA_REFRESH_SECONDS`. Rolling-state при перечитывании сохраняется;
-   - `failed`: исключение ядра на конкретном логе. Лог пропускается, чтобы битая строка не крутила рестарты;
-   - `failed_write_prep`: ядро ответило, но строку `prediction_log` собрать не удалось (NaN в `probability`, новый формат `shap`). Это сбой, а не пропуск;
-   - traceback для `failed`/`failed_write_prep` пишется не чаще раза в минуту, остальные случаи видны только в счётчиках.
-5. TTL раз в `TTL_INTERVAL_SECONDS`: удаляются строки `catboost-aft-*` с `horizon_until < now()`. Строки с решением диспетчера (`decisions_on_prediction`) и строки мока не трогаются.
-6. Обрыв БД: переподключение с backoff 1→60 с, процесс не падает. Непринятые прогнозы остаются в памяти и дописываются следующим тактом. SIGTERM дописывает хвост, сохраняет позицию и завершает процесс.
+Старт: прогрев окон из `events` за 72 ч, pickle ядра не используется. Такт: новые строки `events` пачкой → один прогноз на лог (`channel`, `CHANNEL_EVENT`, `horizon_until = ts + 30 ч`) → запись пачки одной транзакцией. TTL удаляет истёкшие `catboost-aft-*` без решения диспетчера. Обрыв БД — reconnect с backoff.
 
-Позиция чтения (`cursor.py`). `events.id` выдаётся при INSERT, а строка становится видна после COMMIT. Консьюмер Kafka и импорт журнала коммитятся не по порядку id, поэтому чтение `id > max` теряло бы строки. Курсор хранит `low` и множество `seen` уже обработанных id выше него:
+Пропуски и сбои считаются в строке `tick` раз в минуту: `skipped_stale`, `skipped_ooo`, `skipped_unknown`, `failed`, `failed_write_prep`.
 
-- каждый такт читается `id > low AND id NOT IN seen`, так поздний коммит с меньшим id всё равно будет прочитан;
-- `low` поднимается до максимального id, который был виден не меньше `EVENTS_REORDER_LAG_SECONDS` назад (300 с). Потерять строку можно, только если её транзакция коммитится дольше этого лага. У бэкенда транзакция — один лог или чанк импорта в 10 тыс. строк;
-- дыры от `ON CONFLICT DO NOTHING` и откатов не держат курсор: через лаг он проходит мимо них;
-- `seen` ограничен 200 тыс. id. При пике дольше ~220 с на 908 лог/с `low` поднимается раньше лага, и поздние коммиты ниже него теряются. Такой сдвиг пишется в лог как WARNING `cursor seen cap`.
+Курсор (`cursor.py`) читает `id > low AND id NOT IN seen`, чтобы не терять поздние коммиты меньшего id. `low` отстаёт на `EVENTS_REORDER_LAG_SECONDS`, транзакция дольше лага теряет строки. Хранится в `runtime/events_cursor.json` после COMMIT: at-least-once.
 
-Курсор пишется в `runtime/events_cursor.json` (tmp + fsync + rename) после каждой успешной записи пачки. Сбой между COMMIT и записью файла даёт повтор прогнозов одного такта: гарантия at-least-once, без потерь. Без файла (первый запуск) чтение начинается с текущего `max(id)`: бэклог идёт только в прогрев, прогнозы на него не пишутся. Прогрев берёт только уже учтённые курсором строки, остальные обработает цикл, так окна не задваиваются.
+Healthcheck `python -m inference.health`: флаг `ready` после прогрева и свежий `heartbeat`.
 
-Healthcheck `python -m inference.health`: при старте процесса `ready` и `heartbeat` прошлого контейнера удаляются до подключения к БД. Флаг `runtime/ready` ставится после прогрева, `runtime/heartbeat` обновляется после каждого успешного такта, в том числе пустого. Нездоров, если прогрев не завершён или heartbeat старше `HEALTH_MAX_AGE_SECONDS`.
-
-| Переменная | Default | Описание |
-|---|---|---|
-| `INFERENCE_RUNTIME_DIR` | `runtime` | Курсор, heartbeat, `service.log`; в контейнере это volume |
-| `POLL_INTERVAL_SECONDS` | `2` | Пауза между тактами без очереди |
-| `EVENTS_BATCH_SIZE` | `5000` | Строк за такт; полная пачка — следующий такт сразу |
-| `EVENTS_REORDER_LAG_SECONDS` | `300` | Сколько ждать поздний коммит меньшего id |
-| `TTL_INTERVAL_SECONDS` | `60` | Период удаления истёкших прогнозов |
-| `METADATA_REFRESH_SECONDS` | `3600` | Плановое перечитывание реестров |
-| `METADATA_RETRY_SECONDS` | `600` | Минимальный интервал перечитывания из-за неизвестного канала |
-| `HEALTH_MAX_AGE_SECONDS` | `120` | Допустимый возраст heartbeat |
+Env (default): `INFERENCE_RUNTIME_DIR` (`runtime`, volume), `POLL_INTERVAL_SECONDS` (2), `EVENTS_BATCH_SIZE` (5000), `EVENTS_REORDER_LAG_SECONDS` (300), `TTL_INTERVAL_SECONDS` (60), `METADATA_REFRESH_SECONDS` (3600), `METADATA_RETRY_SECONDS` (600), `HEALTH_MAX_AGE_SECONDS` (120).
 
 ### Docker и деплой
 

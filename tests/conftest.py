@@ -9,7 +9,7 @@ import psycopg
 import pytest
 from psycopg.conninfo import conninfo_to_dict
 
-SCHEMA_PATH = Path(__file__).with_name("pg_schema.sql")
+SCHEMA_PATH = Path(__file__).with_name("test_db_schema.sql")
 TEMPLATE_DB = "inference_template"
 
 _db_numbers = itertools.count()
