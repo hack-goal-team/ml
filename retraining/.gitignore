@@ -1,0 +1,3 @@
+artifacts/runs/
+data/incoming_events/*.parquet
+!data/incoming_events/журнал_событий_пример.parquet

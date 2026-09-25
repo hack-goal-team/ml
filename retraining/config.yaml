@@ -1,0 +1,26 @@
+# Настройки полного воспроизводимого запуска.
+# Конфигурации в notebooks/ намеренно не изменяются: параметры ниже применяются
+# только к рабочим копиям тетрадок внутри artifacts/runs/<run_id>/.
+
+input:
+  events_dir: data/incoming_events
+  events_glob: "*.parquet"
+  sensors_file: data/reference/справочник_каналов_датчиков.parquet
+  territory_file: data/reference/справочник_объектов_диспетчер.parquet
+  weather_file: data/reference/open-meteo-55.75N37.63E140m.csv
+
+execution:
+  jupyter_kernel: python3
+  timeout_seconds: 0       # 0 = без ограничения времени для одной тетрадки
+
+# Максимум чанков, используемых тетрадками. Если в прогоне доступно меньше,
+# запускатор автоматически уменьшит это число, чтобы не обращаться к отсутствующим файлам.
+notebook_limits:
+  feature_selection:
+    train_chunks: 4
+    val_chunks: 20
+    test_chunks: 20
+  tuning:
+    train_chunks: 8
+    val_chunks: 80
+    test_chunks: 20

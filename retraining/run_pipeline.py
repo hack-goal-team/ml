@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Подготовить данные и последовательно выполнить неизменяемые шаблоны тетрадок."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+
+import polars as pl
+import yaml
+
+
+ROOT = Path(__file__).resolve().parent
+TEMPLATES_DIR = ROOT / "notebooks"
+RUNS_DIR = ROOT / "artifacts" / "runs"
+NOTEBOOKS = [
+    "1_prepare_dataset.ipynb",
+    "2_create_train_test_datasets_V2_MAIN.ipynb",
+    "3_feature_selection.ipynb",
+    "4_tuning.ipynb",
+    "5_exact_optuna_best_full_test_batched.ipynb",
+]
+
+
+def load_config(path: Path) -> dict:
+    with path.open(encoding="utf-8") as file:
+        return yaml.safe_load(file)
+
+
+def resolve(root: Path, value: str) -> Path:
+    path = Path(value)
+    return path if path.is_absolute() else root / path
+
+
+def require_columns(path: Path, required: set[str], label: str) -> None:
+    schema = pl.scan_parquet(path).collect_schema()
+    missing = required - set(schema.names())
+    if missing:
+        raise ValueError(f"{label}: отсутствуют колонки {sorted(missing)} в {path}")
+
+
+def stage_events(event_files: list[Path], data_dir: Path) -> list[int]:
+    """Собрать все новые parquet-файлы в ext-journal-<год>.parquet для шаблона."""
+    required = {"ид_события", "ид_канала_данных", "дата", "время", "значение_датчика", "тревожное"}
+    for file in event_files:
+        require_columns(file, required, "Журнал событий")
+
+    events = pl.scan_parquet(event_files).with_columns(
+        pl.col("дата").cast(pl.Date, strict=False).alias("дата")
+    )
+    years = (
+        events.select(pl.col("дата").dt.year().alias("year"))
+        .drop_nulls()
+        .unique()
+        .sort("year")
+        .collect()["year"]
+        .to_list()
+    )
+    if not years:
+        raise ValueError("В новых журналах не найдено корректных значений в колонке «дата».")
+
+    for year in years:
+        events.filter(pl.col("дата").dt.year() == year).sink_parquet(
+            data_dir / f"ext-journal-{year}.parquet"
+        )
+    return [int(year) for year in years]
+
+
+def copy_reference_data(config: dict, data_dir: Path) -> None:
+    input_config = config["input"]
+    references = {
+        "справочник_каналов_датчиков.parquet": input_config["sensors_file"],
+        "справочник_объектов_диспетчер.parquet": input_config["territory_file"],
+        "open-meteo-55.75N37.63E140m.csv": input_config["weather_file"],
+    }
+    for destination, source_value in references.items():
+        source = resolve(ROOT, source_value)
+        if not source.is_file():
+            raise FileNotFoundError(f"Не найден обязательный справочник: {source}")
+        shutil.copy2(source, data_dir / destination)
+
+
+def patch_notebook(source: Path, destination: Path, replacements: dict[str, str]) -> None:
+    """Создать рабочую копию, не изменяя шаблон в notebooks/."""
+    notebook = json.loads(source.read_text(encoding="utf-8"))
+    for cell in notebook["cells"]:
+        if cell.get("cell_type") != "code":
+            continue
+        code = "".join(cell.get("source", []))
+        for old, new in replacements.items():
+            code = code.replace(old, new)
+        # В исходной тетрадке есть случайный символ, делающий ячейку невалидной Python.
+        code = code.replace("import polars as plА", "import polars as pl")
+        cell["source"] = code.splitlines(keepends=True)
+    destination.write_text(json.dumps(notebook, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def execute_notebook(notebook: Path, run_dir: Path, kernel: str, timeout: int) -> None:
+    timeout_value = "None" if timeout == 0 else str(timeout)
+    command = [
+        sys.executable, "-m", "jupyter", "nbconvert", "--to", "notebook", "--execute", "--inplace",
+        f"--ExecutePreprocessor.kernel_name={kernel}",
+        f"--ExecutePreprocessor.timeout={timeout_value}", str(notebook),
+    ]
+    print(f"\n>>> Выполняется {notebook.name}")
+    subprocess.run(command, cwd=run_dir, check=True)
+
+
+def chunk_count(run_dir: Path, split: str) -> int:
+    return len(list((run_dir / "data" / f"final_{split}").glob("chunk_*.parquet")))
+
+
+def chunks(limit: int, available: int, split: str) -> list[int]:
+    if available == 0:
+        raise RuntimeError(f"После разбиения не найдено чанков {split}.")
+    return list(range(min(limit, available)))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Полный пайплайн обучения модели")
+    parser.add_argument("--config", type=Path, default=ROOT / "config.yaml")
+    parser.add_argument("--run-id", help="Имя каталога прогона; по умолчанию текущие дата и время")
+    args = parser.parse_args()
+
+    config = load_config(args.config)
+    run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = RUNS_DIR / run_id
+    if run_dir.exists():
+        raise FileExistsError(f"Прогон уже существует: {run_dir}. Укажите другой --run-id.")
+
+    incoming_dir = resolve(ROOT, config["input"]["events_dir"])
+    event_files = sorted(incoming_dir.glob(config["input"]["events_glob"]))
+    if not event_files:
+        raise FileNotFoundError(f"В {incoming_dir} нет файлов {config['input']['events_glob']}")
+
+    run_dir.mkdir(parents=True)
+    data_dir = run_dir / "data"
+    data_dir.mkdir()
+    copy_reference_data(config, data_dir)
+    years = stage_events(event_files, data_dir)
+    print(f"Добавлено файлов журналов: {len(event_files)}; годы: {years}")
+
+    notebooks_dir = run_dir / "notebooks"
+    notebooks_dir.mkdir()
+    first_replacements = {"for year in [2024, 2025, 2026]": f"for year in {years}"}
+    patch_notebook(TEMPLATES_DIR / NOTEBOOKS[0], notebooks_dir / NOTEBOOKS[0], first_replacements)
+    kernel = config["execution"]["jupyter_kernel"]
+    timeout = int(config["execution"]["timeout_seconds"])
+    execute_notebook(notebooks_dir / NOTEBOOKS[0], run_dir, kernel, timeout)
+
+    patch_notebook(TEMPLATES_DIR / NOTEBOOKS[1], notebooks_dir / NOTEBOOKS[1], {})
+    execute_notebook(notebooks_dir / NOTEBOOKS[1], run_dir, kernel, timeout)
+
+    limits = config["notebook_limits"]
+    available = {split: chunk_count(run_dir, split) for split in ("train", "val", "test")}
+    fs = limits["feature_selection"]
+    fs_replacements = {
+        "TRAIN_CHUNKS = [*range(4)]": f"TRAIN_CHUNKS = {chunks(fs['train_chunks'], available['train'], 'train')}",
+        "VAL_CHUNKS = [*range(20)]": f"VAL_CHUNKS = {chunks(fs['val_chunks'], available['val'], 'val')}",
+        "TEST_CHUNKS = [*range(20)]": f"TEST_CHUNKS = {chunks(fs['test_chunks'], available['test'], 'test')}",
+    }
+    patch_notebook(TEMPLATES_DIR / NOTEBOOKS[2], notebooks_dir / NOTEBOOKS[2], fs_replacements)
+    execute_notebook(notebooks_dir / NOTEBOOKS[2], run_dir, kernel, timeout)
+
+    tuning = limits["tuning"]
+    tuning_replacements = {
+        "TRAIN_CHUNKS = [*range(8)]": f"TRAIN_CHUNKS = {chunks(tuning['train_chunks'], available['train'], 'train')}",
+        "VAL_CHUNKS = [*range(80)]": f"VAL_CHUNKS = {chunks(tuning['val_chunks'], available['val'], 'val')}",
+        "TEST_CHUNKS = [*range(20)]": f"TEST_CHUNKS = {chunks(tuning['test_chunks'], available['test'], 'test')}",
+    }
+    patch_notebook(TEMPLATES_DIR / NOTEBOOKS[3], notebooks_dir / NOTEBOOKS[3], tuning_replacements)
+    execute_notebook(notebooks_dir / NOTEBOOKS[3], run_dir, kernel, timeout)
+
+    final_replacements = {
+        "TRAIN_CHUNKS = [*range(8)]": f"TRAIN_CHUNKS = {chunks(tuning['train_chunks'], available['train'], 'train')}",
+        "VAL_CHUNKS = [*range(80)]": f"VAL_CHUNKS = {chunks(tuning['val_chunks'], available['val'], 'val')}",
+    }
+    patch_notebook(TEMPLATES_DIR / NOTEBOOKS[4], notebooks_dir / NOTEBOOKS[4], final_replacements)
+    execute_notebook(notebooks_dir / NOTEBOOKS[4], run_dir, kernel, timeout)
+
+    print(f"\nГотово. Модель: {run_dir / 'survival_optuna/best_model.cbm'}")
+    print(f"Метрики: {run_dir / 'survival_optuna/scores_final.csv'}")
+
+
+if __name__ == "__main__":
+    main()
