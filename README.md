@@ -762,36 +762,14 @@ Env (default): `INFERENCE_RUNTIME_DIR` (`runtime`, volume), `POLL_INTERVAL_SECON
 
 ### Docker и деплой
 
-Образ (`Dockerfile`): `python:3.11-slim`, пользователь `inference` (uid 10001). Внутри только `app.py`, `config.yml`, `inference/` и `data/best_model.cbm`, parquet-журнал в образ не попадает. `CMD python -m inference.runner`, `HEALTHCHECK python -m inference.health` с `start-period` 10 мин на прогрев.
+Образ: `python:3.11-slim`, `CMD python -m inference.runner`, `HEALTHCHECK python -m inference.health` (прогрев до 10 мин). Volume `/app/runtime` хранит курсор, без него рестарт теряет логи за простой.
 
 ```bash
 docker build -t inference:local .
-docker run --rm -v inference-runtime:/app/runtime \
-  -e PGHOST=... -e PGDATABASE=goal -e PGUSER=inference -e PGPASSWORD=... \
-  inference:local
+docker run --rm -v inference-runtime:/app/runtime -e PGHOST=... -e PGUSER=inference -e PGPASSWORD=... inference:local
 ```
 
-Volume монтируется в `/app/runtime` (`INFERENCE_RUNTIME_DIR`): там курсор `events_cursor.json`, `heartbeat`, `ready` и `service.log`. Без volume каждый рестарт — первый запуск с `max(id)`: логи, пришедшие за время простоя, не спрогнозируются.
-
-CI (`.github/workflows/ci.yml`, на PR и вызовом из деплоя): `pytest` со встроенным Postgres (пропуск SQL-тестов считается провалом), `docker build` и smoke-проверка образа.
-
-Деплой (`.github/workflows/deploy.yml`) идёт автоматически на push в `main` и вручную через `workflow_dispatch`. Сначала job `test` вызывает `ci.yml`, и выкладка стартует, только если тесты и сборка образа зелёные:
-
-1. Собирается `inference:<sha>` и едет на VPS по SSH: `docker save | gzip | ssh | docker load`.
-2. Образ тегается `inference:current`. Три последних `inference:<sha>` остаются для отката: `docker tag inference:<sha> inference:current` и `docker compose up -d --no-deps inference`.
-3. Если в `~/backend/compose.yaml` есть сервис `inference`, он перезапускается через `docker compose up -d --no-deps inference`, и деплой ждёт `healthy` до 15 мин. На ошибке печатаются логи. Если сервиса нет, образ только загружается, и workflow пишет notice.
-
-Тег не хранится в `~/backend/.env`: деплой бэкенда переписывает этот файл целиком. Поэтому compose бэкенда ссылается на `image: inference:current`.
-
-Секреты репозитория: `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`, те же, что у бэкенда. Без них workflow сразу падает с `::error::`. Пароль роли `inference` лежит в `.env` бэкенда, этому репо он не нужен.
-
-Порядок первого запуска безопасен в обе стороны. Бэкенд (HACK-136) описывает сервис как `image: inference:current` с `pull_policy: never` и поднимает его, только если такой образ уже есть на VPS. Там же volume `/app/runtime` и гранты на `dim_*_current` и `districts`.
-
-1. Задать секреты этого репо: `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`.
-2. Деплой этого репо (мерж в `main` или `workflow_dispatch`) загружает `inference:current`. Если compose бэкенда уже определяет сервис `inference`, он сразу запускается, и деплой ждёт `healthy`. Если не определяет, образ просто лежит на VPS.
-3. Деплой бэкенда с HACK-136 поднимает сервис, если он ещё не запущен.
-
-Если бэкенд задеплоен раньше образа, его деплой проходит без `inference`: `pull_policy: never` не даёт compose идти за образом в Docker Hub. Сервис поднимет шаг 2.
+CI (`ci.yml`): `pytest` со встроенным Postgres, `docker build`, smoke образа. Деплой (`deploy.yml`, push в `main` или вручную): после CI образ едет на VPS по SSH как `inference:current`, три прошлых `inference:<sha>` остаются для отката. Если в compose бэкенда есть сервис `inference`, он перезапускается и деплой ждёт `healthy`. Секреты: `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`.
 
 Тесты: SQL-часть поднимает встроенный Postgres (`pgserver`) без Docker. Если пакета нет, эти тесты пропускаются.
 
