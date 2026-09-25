@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, time as dt_time, timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import Any, Iterable, Literal, Mapping
+from typing import Any, Callable, Iterable, Literal, Mapping, Protocol
 
 import polars as pl
 import requests
@@ -279,10 +279,20 @@ class WeatherServiceClient:
         self.session.close()
 
 
+class WeatherSource(Protocol):
+    # Контракт клиента погоды: HTTP-клиент выше или inference/weather.py.
+    def get(
+        self,
+        target_hour: datetime,
+    ) -> Mapping[str, float | int | None]: ...
+
+    def close(self) -> None: ...
+
+
 class WeatherCache:
     def __init__(
         self,
-        client: WeatherServiceClient,
+        client: WeatherSource,
         max_entries: int,
     ) -> None:
         self.client = client
@@ -1166,7 +1176,15 @@ class PredictionService:
     def __init__(
         self,
         config: ServiceConfig,
+        metadata_loader: Callable[
+            [CompiledModelFeatures],
+            dict[int, dict[str, Any]],
+        ]
+        | None = None,
+        weather_client: WeatherSource | None = None,
     ) -> None:
+        # Точки подмены для inference из Postgres (inference/).
+        # Без них поведение прежнее: parquet и HTTP weather-service.
         self.config = config
         self.logger = configure_logging(
             config
@@ -1196,9 +1214,13 @@ class PredictionService:
             )
         )
 
-        self.metadata = load_metadata(
-            compiled=self.compiled,
-            config=config,
+        self.metadata = (
+            metadata_loader(self.compiled)
+            if metadata_loader is not None
+            else load_metadata(
+                compiled=self.compiled,
+                config=config,
+            )
         )
 
         self.store = OnlineFeatureStore(
@@ -1207,7 +1229,9 @@ class PredictionService:
         )
 
         self.weather_client = (
-            WeatherServiceClient(
+            weather_client
+            if weather_client is not None
+            else WeatherServiceClient(
                 url=config.weather_service_url,
                 timeout_seconds=(
                     config
