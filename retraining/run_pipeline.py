@@ -115,9 +115,13 @@ def chunk_count(run_dir: Path, split: str) -> int:
     return len(list((run_dir / "data" / f"final_{split}").glob("chunk_*.parquet")))
 
 
-def chunks(limit: int, available: int, split: str) -> list[int]:
+def chunks(limit: int | str, available: int, split: str) -> list[int]:
     if available == 0:
         raise RuntimeError(f"После разбиения не найдено чанков {split}.")
+    if limit == "all":
+        return list(range(available))
+    if not isinstance(limit, int) or limit < 1:
+        raise ValueError(f"Неверный лимит чанков {split}: {limit!r}")
     return list(range(min(limit, available)))
 
 
@@ -176,9 +180,11 @@ def main() -> None:
     patch_notebook(TEMPLATES_DIR / NOTEBOOKS[3], notebooks_dir / NOTEBOOKS[3], tuning_replacements)
     execute_notebook(notebooks_dir / NOTEBOOKS[3], run_dir, kernel, timeout)
 
+    final = limits.get("final_training", tuning)
     final_replacements = {
-        "TRAIN_CHUNKS = [*range(8)]": f"TRAIN_CHUNKS = {chunks(tuning['train_chunks'], available['train'], 'train')}",
-        "VAL_CHUNKS = [*range(80)]": f"VAL_CHUNKS = {chunks(tuning['val_chunks'], available['val'], 'val')}",
+        "TRAIN_CHUNKS = [*range(8)]": f"TRAIN_CHUNKS = {chunks(final['train_chunks'], available['train'], 'train')}",
+        "VAL_CHUNKS = [*range(80)]": f"VAL_CHUNKS = {chunks(final['val_chunks'], available['val'], 'val')}",
+        "# Те же чанки, что были в 4_tuning.ipynb": "# Финальное обучение использует лимиты из config.yaml",
     }
     patch_notebook(TEMPLATES_DIR / NOTEBOOKS[4], notebooks_dir / NOTEBOOKS[4], final_replacements)
     execute_notebook(notebooks_dir / NOTEBOOKS[4], run_dir, kernel, timeout)
