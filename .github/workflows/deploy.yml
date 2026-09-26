@@ -75,16 +75,12 @@ jobs:
           docker save "$IMAGE" | gzip | ssh vps 'gunzip | sudo -n docker load'
 
       # Стабильный тег, а не переменная в .env: деплой бэкенда переписывает
-      # ~/backend/.env целиком. inference:<sha> остаются для отката.
+      # ~/backend/.env целиком.
       - name: Tag current
         run: |
           ssh vps "SHA=${{ github.sha }} bash -s" <<'EOF'
           set -euo pipefail
           sudo -n docker tag "inference:$SHA" inference:current
-          # Храним три последних sha; image prune бэкенда их не трогает.
-          sudo -n docker image ls inference --format '{{.Tag}} {{.CreatedAt}}' \
-            | grep -Ev '^(current|<none>) ' | sort -k2 -r | awk 'NR > 3 {print $1}' \
-            | while read -r tag; do sudo -n docker image rm "inference:$tag" || true; done
           EOF
 
       - name: Restart service
@@ -122,4 +118,16 @@ jobs:
             sleep 15
           done
           sudo -n docker compose logs --tail 20 inference
+          EOF
+
+      # После рестарта: старый образ уже не держит контейнер. Хранятся текущий
+      # sha и один предыдущий для отката (образ 2.3 ГБ).
+      - name: Prune old images
+        run: |
+          ssh vps "SHA=${{ github.sha }} bash -s" <<'EOF'
+          set -euo pipefail
+          sudo -n docker image ls inference --format '{{.CreatedAt}}\t{{.Tag}}' \
+            | { grep -vP "\t(current|$SHA)\$" || true; } | sort -r | tail -n +2 | cut -f2 \
+            | while read -r tag; do sudo -n docker image rm "inference:$tag" >/dev/null || true; done
+          sudo -n docker image prune -f >/dev/null
           EOF
