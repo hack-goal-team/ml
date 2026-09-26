@@ -1,0 +1,7 @@
+{
+  "settings": "/private/path/cloud-settings.json",
+  "state_dir": "/private/path/terraform-state",
+  "events_dir": "/private/path/events-parquet",
+  "yc": "yc",
+  "tofu": "tofu"
+}

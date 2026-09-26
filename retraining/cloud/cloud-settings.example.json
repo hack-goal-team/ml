@@ -1,0 +1,11 @@
+{
+  "folder_id": "<folder-id>",
+  "zone": "ru-central1-a",
+  "subnet_id": "<subnet-id>",
+  "security_group_id": "<egress-only-security-group-id>",
+  "service_account_id": "<service-account-id>",
+  "bucket_name": "<private-training-bucket>",
+  "cores": 16,
+  "memory_gib": 128,
+  "work_disk_gib": 450
+}
