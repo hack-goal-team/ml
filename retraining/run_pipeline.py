@@ -141,6 +141,8 @@ def main() -> None:
     event_files = sorted(incoming_dir.glob(config["input"]["events_glob"]))
     if not event_files:
         raise FileNotFoundError(f"В {incoming_dir} нет файлов {config['input']['events_glob']}")
+    if len(event_files) > 1 and any(file.name == "журнал_событий_пример.parquet" for file in event_files):
+        raise ValueError("Исключите журнал_событий_пример.parquet из полного прогона через events_dir или events_glob")
 
     run_dir.mkdir(parents=True)
     data_dir = run_dir / "data"
