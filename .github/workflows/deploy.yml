@@ -120,13 +120,14 @@ jobs:
           sudo -n docker compose logs --tail 20 inference
           EOF
 
-      # После рестарта: старый образ уже не держит контейнер. Хранится только
-      # текущий sha (образ 2.3 ГБ), откат — revert в main и новый деплой.
+      # После рестарта: старый образ уже не держит контейнер. Хранятся текущий
+      # sha и один предыдущий для отката (образ 2.3 ГБ).
       - name: Prune old images
         run: |
           ssh vps "SHA=${{ github.sha }} bash -s" <<'EOF'
           set -euo pipefail
-          sudo -n docker image ls inference --format '{{.Tag}}' | { grep -vxE "current|$SHA" || true; } \
+          sudo -n docker image ls inference --format '{{.CreatedAt}}\t{{.Tag}}' \
+            | { grep -vP "\t(current|$SHA)\$" || true; } | sort -r | tail -n +2 | cut -f2 \
             | while read -r tag; do sudo -n docker image rm "inference:$tag" >/dev/null || true; done
           sudo -n docker image prune -f >/dev/null
           EOF

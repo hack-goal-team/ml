@@ -769,7 +769,7 @@ docker build -t inference:local .
 docker run --rm -v inference-runtime:/app/runtime -e PGHOST=... -e PGUSER=inference -e PGPASSWORD=... inference:local
 ```
 
-CI (`ci.yml`): `pytest` со встроенным Postgres, `docker build`, smoke образа. Деплой (`deploy.yml`, push в `main` или вручную): после CI образ едет на VPS по SSH как `inference:current`, старые образы удаляются. Если в compose бэкенда есть сервис `inference`, он перезапускается и деплой ждёт `healthy`. Секреты: `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`.
+CI (`ci.yml`): `pytest` со встроенным Postgres, `docker build`, smoke образа. Деплой (`deploy.yml`, push в `main` или вручную): после CI образ едет на VPS по SSH как `inference:current`, хранятся текущий и один предыдущий `inference:<sha>` для отката. Если в compose бэкенда есть сервис `inference`, он перезапускается и деплой ждёт `healthy`. Секреты: `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`.
 
 Тесты: SQL-часть поднимает встроенный Postgres (`pgserver`) без Docker. Если пакета нет, эти тесты пропускаются.
 
