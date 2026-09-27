@@ -8,7 +8,7 @@ from pathlib import Path
 
 from app import PredictionService, ServiceConfig
 
-from backtest.weather import CsvWeatherClient
+from tests.backtest.weather import CsvWeatherClient
 
 
 def build_offline_service(

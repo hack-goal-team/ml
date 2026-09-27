@@ -4,7 +4,7 @@ retraining/notebooks/2_create_train_test_datasets_V2_MAIN.ipynb (get_device_spli
 Универсум id — уникальные ид_канала_данных из журналов 2024-2026
 (retraining/notebooks/1_prepare_dataset.ipynb), затем sort + shuffle(seed=69) +
 head(90%)/slice(5%)/остаток. Совпадение размеров train/val/test (10366/575/577)
-с ноутбуком проверено вручную и задокументировано в docs/backtest/backtest.md.
+с ноутбуком проверено вручную и задокументировано в tests/backtest/backtest.md.
 """
 from __future__ import annotations
 

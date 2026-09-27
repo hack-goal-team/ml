@@ -1,6 +1,6 @@
 """Оффлайн-бэктест HACK-174: одна команда, весь конвейер.
 
-    python -m backtest.run --dataset-dir /path/to/Sources/dataset
+    python -m tests.backtest.run --dataset-dir /path/to/Sources/dataset
 
 Путь к данным обязателен: через --dataset-dir или переменную окружения
 HACK174_DATASET_DIR (см. backtest/README.md). Читает журналы событий и
@@ -8,8 +8,8 @@ HACK174_DATASET_DIR (см. backtest/README.md). Читает журналы со
 (та же модель, что на стенде), считает вероятность тревоги на смены
 апрель-июнь 2026 по тестовым каналам сплита в двух вариантах — «прогноз
 ровно на границе смены» и «то, что стенд реально показывал по последнему
-событию» — и сравнивает с двумя бейзлайнами. Результат — docs/backtest/*.csv
-(predictions.csv не коммитится, см. .gitignore) и docs/backtest/backtest.md.
+событию» — и сравнивает с двумя бейзлайнами. Результат — tests/backtest/results/*.csv
+(predictions.csv не коммитится, см. .gitignore) и tests/backtest/backtest.md.
 """
 from __future__ import annotations
 
@@ -23,14 +23,14 @@ from pathlib import Path
 
 import polars as pl
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
-from backtest import channels, data, episodes, isalarm_check, metrics, prodstyle  # noqa: E402
-from backtest.dispatch import channel_dispatchers, dispatcher_scale  # noqa: E402
-from backtest.predict import predict_shifts  # noqa: E402
-from backtest.service import build_offline_service  # noqa: E402
-from backtest.warmstate import last_state_before  # noqa: E402
+from tests.backtest import channels, data, episodes, metrics, prodstyle  # noqa: E402
+from tests.backtest.dispatch import channel_dispatchers, dispatcher_scale  # noqa: E402
+from tests.backtest.predict import predict_shifts  # noqa: E402
+from tests.backtest.service import build_offline_service  # noqa: E402
+from tests.backtest.warmstate import last_state_before  # noqa: E402
 
 HORIZON_HOURS = 24.0
 SHIFT_HOURS = (8, 20)
@@ -124,7 +124,7 @@ def main() -> None:
         type=Path,
         default=REPO_ROOT / "retraining/data/reference/open-meteo-55.75N37.63E140m.csv",
     )
-    parser.add_argument("--output-dir", type=Path, default=REPO_ROOT / "docs/backtest")
+    parser.add_argument("--output-dir", type=Path, default=Path(__file__).resolve().parent / "results")
     # Своя temp-директория на прогон: устаревший metadata-кеш/state не
     # должен подмешаться (тот же приём, что и в inference/runner.py).
     parser.add_argument(
@@ -140,7 +140,7 @@ def main() -> None:
     started = time.perf_counter()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    print("1/8 test-channel split (notebooks/2, seed=69)...")
+    print("1/7 test-channel split (notebooks/2, seed=69)...")
     test_ids = channels.test_channel_ids(dataset_dir)
     pl.DataFrame({"ид_канала_данных": test_ids}).write_csv(
         args.output_dir / "test_channels.csv"
@@ -149,14 +149,14 @@ def main() -> None:
 
     load_start = args.start - timedelta(days=WARMUP_PAD_DAYS)
     load_end = args.end + timedelta(days=OUTCOME_PAD_DAYS, hours=1)
-    print(f"2/8 loading events [{load_start}, {load_end}] for test channels...")
+    print(f"2/7 loading events [{load_start}, {load_end}] for test channels...")
     events_df = data.load_events(dataset_dir, test_ids, load_start, load_end)
     print(f"    events: {events_df.height}")
 
-    print("3/8 warming episode state from before the load window...")
+    print("3/7 warming episode state from before the load window...")
     seed_states = last_state_before(dataset_dir, test_ids, load_start)
 
-    print("4/8 building service (app.PredictionService, offline weather)...")
+    print("4/7 building service (app.PredictionService, offline weather)...")
     service = build_offline_service(REPO_ROOT, args.weather_csv, args.runtime_dir)
 
     have_events = set(events_df["ид_канала_данных"].unique().to_list())
@@ -171,7 +171,7 @@ def main() -> None:
 
     shift_times = _valid_shift_times(args.start, args.end, HORIZON_HOURS)
     print(
-        f"5/8 predicting {len(usable_ids)} channels x {len(shift_times)} shifts "
+        f"5/7 predicting {len(usable_ids)} channels x {len(shift_times)} shifts "
         f"(fresh-t0 + prodstyle)..."
     )
     predictions = predict_shifts(
@@ -186,7 +186,7 @@ def main() -> None:
     )
     prodstyle_by_key = {(p.channel_id, p.t0): p for p in prod_predictions}
 
-    print("6/8 episodes, baselines, dispatcher grouping...")
+    print("6/7 episodes, baselines, dispatcher grouping...")
     timelines = episodes.build_timelines(events_df, seed_states)
     dispatchers_all = channel_dispatchers(
         service.config.sensors_metadata_path,
@@ -202,14 +202,7 @@ def main() -> None:
     )
     breakdown.write_csv(args.output_dir / "episode_value_breakdown.csv")
 
-    print("7/8 isAlarm sanity check (тревожное vs справочник_состояний)...")
-    isalarm = isalarm_check.check(
-        events_df, dataset_dir / "справочник_состояний.csv", dataset_dir / "справочник_каналов_датчиков.csv"
-    )
-    for name, table in isalarm.items():
-        table.write_csv(args.output_dir / f"isalarm_{name}.csv")
-
-    print("8/8 metrics, bootstrap CI, report...")
+    print("7/7 metrics, bootstrap CI, report...")
     comparison = metrics.build_comparison_table(df, dispatcher_scale=scale)
     comparison.write_csv(float_precision=6, file=args.output_dir / "comparison_table.csv")
     calibration = metrics.calibration_table(df)
