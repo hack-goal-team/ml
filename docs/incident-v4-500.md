@@ -2,8 +2,10 @@
 
 The second inference container uses `data/incident4/model_500.cbm` and
 `PREDICTION_KIND=INCIDENT`. It writes FIRE, FLOOD, GAS or INTRUSION with a
-30-hour horizon. The equipment container retains `CHANNEL_EVENT` and its
-own cursor and model version.
+30-hour horizon. The equipment container keeps its own cursor and model version. It writes
+`EQUIPMENT_FAILURE` only for channels without an incident class: its target is
+any alarm, which on a classed channel mixes faults with incidents, so there it
+keeps `CHANNEL_EVENT` (hidden by Backend as LEGACY).
 
 `hours_since_prev_target` is the time since the previous target alarm on the
 same channel, excluding the current event. `target_seed.json` contains the

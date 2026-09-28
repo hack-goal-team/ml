@@ -30,11 +30,12 @@ class FakeClock:
         return self.now
 
 
-def add_channel(conn: psycopg.Connection, channel_id: int) -> None:
+def add_channel(conn: psycopg.Connection, channel_id: int,
+                sensor_type: str = "КД АВ") -> None:
     conn.execute(
         "INSERT INTO dim_channels VALUES "
-        "(%s, %s, 'Охранная подсистема', 'КД АВ', '15-11.1.131.2.', 'КД АВ', 20)",
-        (channel_id, SNAPSHOT),
+        "(%s, %s, 'Охранная подсистема', %s, '15-11.1.131.2.', 'КД АВ', 20)",
+        (channel_id, SNAPSHOT, sensor_type),
     )
 
 
@@ -238,6 +239,23 @@ def test_unknown_channel_picked_up_after_reload(db, make_runner) -> None:
     runner.tick(conn)
 
     assert [row[1] for row in predictions(db)] == [str(NEW_CHANNEL)]
+
+
+def test_classless_channel_writes_equipment_failure(db, make_runner) -> None:
+    runner, conn = started(make_runner, db, threshold=0.0)
+    now = datetime.now(timezone.utc)
+
+    with db.admin() as admin:
+        add_channel(admin, NEW_CHANNEL, "ИБП")
+    runner.monotonic.now += 700
+    runner._reload_metadata(conn, "test")
+    with db.admin() as admin:
+        add_event(admin, NEW_CHANNEL, now - timedelta(minutes=1), "Неисправен")
+        add_event(admin, CHANNEL, now - timedelta(minutes=1), "Неисправен")
+    runner.tick(conn)
+
+    types = {row[1]: row[2] for row in predictions(db)}
+    assert types == {str(NEW_CHANNEL): "EQUIPMENT_FAILURE", str(CHANNEL): "CHANNEL_EVENT"}
 
 
 def test_ttl_keeps_decisions_and_foreign_rows(db, make_runner) -> None:

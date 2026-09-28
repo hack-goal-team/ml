@@ -365,7 +365,11 @@ class Runner:
         sensor_type = service.metadata[event.channel_id].get("тип_датчика")
         target_alarm = False
         previous_hours = None
-        incident = "CHANNEL_EVENT"
+        # Модель поломок прогнозирует любую тревогу: на канале без класса это
+        # отказ оборудования, на канале с классом — смесь с инцидентом, её
+        # не выдаём за отказ и оставляем прежним CHANNEL_EVENT.
+        incident = ("CHANNEL_EVENT" if incident_class(sensor_type)
+                    else "EQUIPMENT_FAILURE")
         if self.targets is not None:
             incident = incident_class(sensor_type)
             if incident is None:
