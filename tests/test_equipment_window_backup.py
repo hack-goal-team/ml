@@ -37,7 +37,9 @@ case "$*" in
       echo 'column "journal_is_alarm" does not exist'; fi ;;
   'image inspect -f {{.Id}} inference:current') echo sha256:old-image ;;
   'compose stop inference') : ;;
-  'compose start inference') [ "${MOCK_FAIL_START:-0}" != 1 ] ;;
+  'compose start inference')
+    if [ "${MOCK_CONSUME_STDIN:-0}" = 1 ]; then cat >/dev/null; fi
+    [ "${MOCK_FAIL_START:-0}" != 1 ] ;;
   'cp old-container:/app/runtime/. -')
     if [ "${MOCK_FAIL_CP:-0}" = 1 ]; then exit 2; fi
     tar -C "$MOCK_RUNTIME" -cf - . ;;
@@ -60,7 +62,7 @@ esac
 
 def _run(tmp_path: Path, fail_copy: bool = False, fail_start: bool = False,
          no_inference: bool = False, schema_error: bool = False,
-         healthy_error: bool = False
+         healthy_error: bool = False, streamed: bool = False
          ) -> tuple[subprocess.CompletedProcess[str], Path]:
     bin_dir = _mock_tools(tmp_path)
     runtime = tmp_path / "runtime"
@@ -86,9 +88,13 @@ def _run(tmp_path: Path, fail_copy: bool = False, fail_start: bool = False,
         "MOCK_NO_INFERENCE": "1" if no_inference else "0",
         "MOCK_SCHEMA_ERROR": "1" if schema_error else "0",
         "MOCK_HEALTHY_ERROR": "1" if healthy_error else "0",
+        "MOCK_CONSUME_STDIN": "1" if streamed else "0",
     }
-    result = subprocess.run(["bash", str(SCRIPT)], env=env, text=True,
-                            capture_output=True, check=False)
+    result = subprocess.run(
+        ["bash", "-s"] if streamed else ["bash", str(SCRIPT)],
+        env=env, input=SCRIPT.read_text() if streamed else None,
+        text=True, capture_output=True, check=False,
+    )
     return result, backup
 
 
@@ -112,6 +118,15 @@ def test_snapshot_contains_cursor_window_and_model(tmp_path: Path) -> None:
                    capture_output=True)
     calls = (tmp_path / "calls.log").read_text()
     assert calls.index("compose stop inference") < calls.index("compose start inference")
+
+
+def test_streamed_deploy_script_completes_snapshot(tmp_path: Path) -> None:
+    result, backup = _run(tmp_path, streamed=True)
+    assert result.returncode == 0, result.stderr
+    assert "equipment window saved:" in result.stdout
+    snapshots = list((backup / "inference-windows").glob("equipment-*"))
+    assert len(snapshots) == 1
+    assert (snapshots[0] / "SHA256SUMS").is_file()
 
 
 def test_failed_cursor_copy_restarts_old_service(tmp_path: Path) -> None:
