@@ -23,15 +23,13 @@ container=$(docker compose ps -q inference)
 }
 old_health=$(docker inspect -f '{{.State.Health.Status}}' "$container")
 schema_recovery=0
-if [[ $old_health != healthy ]]; then
-  old_logs=$(docker logs --tail 100 "$container" 2>&1)
-  if grep -Fq 'column "journal_is_alarm" does not exist' <<<"$old_logs"; then
-    schema_recovery=1
-    echo 'old equipment is blocked by missing journal_is_alarm; preserving its window before repair'
-  else
-    echo "old equipment is not healthy: $old_health" >&2
-    exit 1
-  fi
+old_logs=$(docker logs --tail 100 "$container" 2>&1)
+if grep -Fq 'column "journal_is_alarm" does not exist' <<<"$old_logs"; then
+  schema_recovery=1
+  echo 'old equipment is blocked by missing journal_is_alarm; preserving its window before repair'
+elif [[ $old_health != healthy ]]; then
+  echo "old equipment is not healthy: $old_health" >&2
+  exit 1
 fi
 image=$(docker image inspect -f '{{.Id}}' inference:current)
 [[ -n $image ]] || { echo 'inference:current image is missing' >&2; exit 1; }
