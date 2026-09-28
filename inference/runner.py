@@ -42,8 +42,11 @@ log = logging.getLogger("inference")
 
 CURSOR_FILE = "events_cursor.json"
 TARGETS_FILE = "incident_targets.json"
+# Бэкфилл выполняется один раз на том runtime: маркер переживает рестарты.
+BACKFILL_FILE = "backfill.done"
 
 SELECT_MAX_ID = "SELECT coalesce(max(id), 0) FROM events"
+SELECT_BACKFILL_LOW = "SELECT min(id) - 1 FROM events WHERE ts >= %s"
 
 # Прогрев — только то, что уже учтено курсором: остальное придёт
 # в цикле, и второй update задвоил бы окна.
@@ -80,6 +83,7 @@ class RunnerSettings:
     backoff_max_seconds: float = 60.0
     shap_max_per_tick: int = 8
     shap_budget_ms: float = 500.0
+    backfill_hours: float = 0.0
 
     @classmethod
     def from_env(
@@ -102,6 +106,7 @@ class RunnerSettings:
             ),
             shap_max_per_tick=int(env.get("SHAP_MAX_PER_TICK") or 8),
             shap_budget_ms=_env_float(env, "SHAP_BUDGET_MS", 500.0),
+            backfill_hours=_env_float(env, "BACKFILL_HOURS", 0.0),
         )
 
 
@@ -216,6 +221,9 @@ class Runner:
                 cursor = EventCursor(
                     low, lag_seconds=self.options.reorder_lag_seconds
                 )
+            backfill = self._backfill_cursor(conn)
+            if backfill is not None:
+                cursor, fresh = backfill, True
             rows = self._warmup(conn, service, cursor)
             self.classed = classed_channels(conn)
             if self.settings.prediction_kind == "INCIDENT":
@@ -239,6 +247,8 @@ class Runner:
         cursor.save(self.path(CURSOR_FILE))
         if self.targets is not None:
             self.targets.save(self.path(TARGETS_FILE), cursor.low, cursor.seen)
+        if self.options.backfill_hours > 0:
+            self.path(BACKFILL_FILE).touch()
         self.path(READY_FILE).touch()
         log.info(
             "started fresh=%s low=%d seen=%d warmup_rows=%d channels=%d "
@@ -248,6 +258,23 @@ class Runner:
             self.window.total_seconds() / 3600,
         )
 
+    def _backfill_span(self) -> timedelta:
+        if self.options.backfill_hours <= 0 or self.path(BACKFILL_FILE).exists():
+            return timedelta(0)
+        return timedelta(hours=self.options.backfill_hours)
+
+    def _backfill_cursor(self, conn: psycopg.Connection) -> EventCursor | None:
+        """Курсор на начало окна бэкфилла: поток заново прогнозирует события
+        за backfill_hours, чтобы у тихих с момента старта каналов был прогноз."""
+        span = self._backfill_span()
+        if not span:
+            return None
+        low = conn.execute(SELECT_BACKFILL_LOW, (self.clock() - span,)).fetchone()[0]
+        if low is None:
+            return None
+        log.info("backfill hours=%.0f low=%d", span.total_seconds() / 3600, low)
+        return EventCursor(low, lag_seconds=self.options.reorder_lag_seconds)
+
     def _warmup(
         self,
         conn: psycopg.Connection,
@@ -255,7 +282,8 @@ class Runner:
         cursor: EventCursor,
     ) -> int:
         params = {
-            "since": self.clock() - self.window,
+            # При бэкфилле окна прогреваются и до его начала.
+            "since": self.clock() - self.window - self._backfill_span(),
             "low": cursor.low,
             "seen": list(cursor.seen),
         }
