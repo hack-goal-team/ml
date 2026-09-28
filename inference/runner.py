@@ -54,7 +54,7 @@ SELECT_WARMUP = """
 
 # Фильтр по ts отсекает старые партиции и импорт истории вне окон.
 SELECT_NEW = """
-    SELECT id, channel_id, ts, raw_value, is_alarm FROM events
+    SELECT id, channel_id, ts, raw_value, is_alarm, journal_is_alarm FROM events
     WHERE ts >= %(since)s AND id > %(low)s
       AND id <> ALL(%(seen)s::bigint[])
     ORDER BY id
@@ -136,6 +136,7 @@ class EventRow:
     ts: datetime
     raw_value: str
     is_alarm: bool
+    journal_is_alarm: bool | None
 
 
 def utcnow() -> datetime:
@@ -368,7 +369,8 @@ class Runner:
                 counters.skipped_nonincident += 1
                 return
             target_alarm = is_target_alarm(
-                sensor_type, event.raw_value, event.is_alarm
+                sensor_type, event.raw_value, event.is_alarm,
+                event.journal_is_alarm,
             )
             previous_hours = self.targets.hours_before(event.channel_id, event.ts)
 

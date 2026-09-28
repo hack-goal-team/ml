@@ -1,6 +1,8 @@
 {
   "model": "model_500.cbm",
   "sha256": "178c874ca373a5c48327d4a221379ea9ee166480385393425b96dd5002ce21f9",
+  "target_seed_sha256": "3161acd2ab38454f009aeb2b088ba53d7c673603ea9306aad7d5b4c87ae05deb",
+  "target_seed_source_rows": 259283128,
   "trees": 500,
   "features": 177,
   "horizon_hours": 30,

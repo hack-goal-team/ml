@@ -6,13 +6,18 @@ The second inference container uses `data/incident4/model_500.cbm` and
 own cursor and model version.
 
 `hours_since_prev_target` is the time since the previous target alarm on the
-same channel, excluding the current event. On restart, the runner loads its
-checkpoint only if it matches the event cursor. Otherwise it queries alarm
-history from Postgres. Before the first production start, verify that the
-`alarm_backfill` marker exists and inspect `EXPLAIN ANALYZE` for the history
-query on the stand. The backfill changes `events.is_alarm`; the source journal
-alarm flag for intrusion is no longer separately available in Postgres, so
-historical intrusion targets cannot exactly reproduce training labels.
+same channel, excluding the current event. `target_seed.json` contains the
+last target per channel from 259,283,128 original journal rows in 2019–2020
+and 2022–June 2026. The seed is built by `retraining/build_incident_seed.py`;
+2021 is excluded as in training. Backend stores a compact checkpoint for
+targets between the seed cutoff and the recent replay window. On restart, the
+runner loads its cursor checkpoint when it matches; otherwise it merges the
+seed and Backend checkpoint, then replays events from `covered_until`.
+INTRUSION uses the original `journal_is_alarm` flag preserved by Backend;
+a missing flag on a candidate event stops startup. The first rollout restores
+this column only for the most recent 72 hours from the SMVU mock journal.
+New events retain the original flag in the ingestion handler. Verify the
+backfill and replay query on the stand before production.
 
 At most eight incident SHAP explanations start per tick, and no new one starts
 after 500 ms of accumulated SHAP time. Predictions beyond this limit still

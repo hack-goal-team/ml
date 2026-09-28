@@ -74,6 +74,7 @@ CREATE TABLE events (
     ts          timestamptz NOT NULL,
     is_alarm    boolean     NOT NULL,
     raw_value   text        NOT NULL,
+    journal_is_alarm boolean,
     PRIMARY KEY (id, ts),
     UNIQUE (event_id, ts)
 ) PARTITION BY RANGE (ts);
@@ -82,6 +83,15 @@ CREATE TABLE events_default PARTITION OF events DEFAULT;
 CREATE TABLE alarm_backfill (finished_at timestamptz NOT NULL DEFAULT now());
 INSERT INTO alarm_backfill DEFAULT VALUES;
 GRANT SELECT ON alarm_backfill TO inference;
+
+CREATE TABLE incident_history_checkpoint (
+    id smallint PRIMARY KEY CHECK (id = 1),
+    covered_until timestamptz NOT NULL,
+    targets jsonb NOT NULL
+);
+INSERT INTO incident_history_checkpoint VALUES
+    (1, '2026-07-01 00:00:00+03', '{}'::jsonb);
+GRANT SELECT ON incident_history_checkpoint TO inference;
 
 CREATE TABLE reason_codes (
     code         text PRIMARY KEY,

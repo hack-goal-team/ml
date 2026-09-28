@@ -14,6 +14,7 @@ SENSOR_CLASSES = json.loads(
     (Path(__file__).resolve().parent.parent / "data/incident4/incident_by_sensor.json")
     .read_text(encoding="utf-8")
 )
+SEED_PATH = Path(__file__).resolve().parent.parent / "data/incident4/target_seed.json"
 INCIDENT_VALUES = {
     "FIRE": frozenset((
         "Обнаружен дым", "Рычаг сдернут", "Рычаг сдернут влево",
@@ -35,22 +36,19 @@ OPEN_CONTACT = frozenset((
     "КД АВ", "Стекло", "9-секционный люк",
 ))
 
-SELECT_LAST_TARGETS = """
-    SELECT DISTINCT ON (e.channel_id) e.channel_id, e.ts, e.id
+SELECT_SINCE_CHECKPOINT = """
+    SELECT e.channel_id, e.ts, e.id, e.raw_value, e.is_alarm,
+           e.journal_is_alarm, c.sensor_type
     FROM events e
     JOIN dim_channels_current c ON c.channel_id = e.channel_id
-    WHERE e.is_alarm
-      AND (e.ts < timestamptz '2021-01-01 00:00:00+03'
-           OR e.ts >= timestamptz '2022-01-01 00:00:00+03')
+    WHERE e.ts >= %(cutoff)s
       AND (e.id <= %(low)s OR e.id = ANY(%(seen)s::bigint[]))
+      AND c.sensor_type = ANY(%(sensors)s::text[])
       AND (
-        (c.sensor_type = ANY(%(fire)s::text[]) AND e.raw_value = ANY(%(fire_values)s::text[]))
-        OR (c.sensor_type = ANY(%(flood)s::text[]) AND e.raw_value = ANY(%(flood_values)s::text[]))
-        OR (c.sensor_type = ANY(%(gas)s::text[]) AND e.raw_value = ANY(%(gas_values)s::text[]))
-        OR (c.sensor_type = ANY(%(intrusion)s::text[]) AND e.raw_value = ANY(%(intrusion_values)s::text[]))
-        OR (c.sensor_type = ANY(%(open_contact)s::text[]) AND e.raw_value = 'Не замкнут')
+        e.raw_value = ANY(%(values)s::text[])
+        OR e.raw_value = 'Не замкнут'
       )
-    ORDER BY e.channel_id, e.ts DESC, e.id DESC
+    ORDER BY e.channel_id, e.ts, e.id
 """
 
 
@@ -58,14 +56,19 @@ def incident_class(sensor_type: str | None) -> str | None:
     return SENSOR_CLASSES.get(sensor_type)
 
 
-def is_target_alarm(sensor_type: str | None, value: str, is_alarm: bool) -> bool:
+def is_target_alarm(sensor_type: str | None, value: str, is_alarm: bool,
+                    journal_alarm: bool | None = None) -> bool:
     kind = incident_class(sensor_type)
-    return bool(
-        is_alarm and kind and (
-            value in INCIDENT_VALUES[kind]
-            or (value == "Не замкнут" and sensor_type in OPEN_CONTACT)
-        )
-    )
+    candidate = bool(kind and (
+        value in INCIDENT_VALUES[kind]
+        or (value == "Не замкнут" and sensor_type in OPEN_CONTACT)
+    ))
+    if not candidate:
+        return False
+    alarm = journal_alarm if kind == "INTRUSION" else is_alarm
+    if kind == "INTRUSION" and journal_alarm is None:
+        raise RuntimeError("Original intrusion alarm flag is missing")
+    return bool(alarm)
 
 
 @dataclass
@@ -110,22 +113,36 @@ class TargetHistory:
 
     @classmethod
     def from_db(cls, conn: psycopg.Connection, low: int,
-                seen: set[int]) -> "TargetHistory":
+                seen: set[int], seed_path: Path = SEED_PATH) -> "TargetHistory":
         marker = conn.execute(
             "SELECT EXISTS (SELECT 1 FROM alarm_backfill)"
         ).fetchone()[0]
         if not marker:
             raise RuntimeError("alarm_backfill must finish before incident inference")
-        params: dict[str, object] = {"low": low, "seen": list(seen),
-                                    "open_contact": list(OPEN_CONTACT)}
-        for kind in INCIDENT_VALUES:
-            params[kind.lower()] = [sensor for sensor, value in SENSOR_CLASSES.items()
-                                    if value == kind]
-            params[kind.lower() + "_values"] = list(INCIDENT_VALUES[kind])
+        seed = json.loads(seed_path.read_text(encoding="utf-8"))
+        latest = cls({int(channel): (datetime.fromisoformat(row[0]), int(row[1]))
+                      for channel, row in seed["latest"].items()})
+        checkpoint = conn.execute(
+            "SELECT covered_until, targets FROM incident_history_checkpoint WHERE id = 1"
+        ).fetchone()
+        if checkpoint is None:
+            raise RuntimeError("incident history checkpoint is missing")
+        cutoff, targets = checkpoint
+        if cutoff < datetime.fromisoformat(seed["cutoff"]):
+            raise RuntimeError("incident history checkpoint predates model seed")
+        for channel, row in targets.items():
+            latest.mark(int(channel), datetime.fromisoformat(row[0]), int(row[1]))
+        params = {
+            "cutoff": cutoff, "low": low, "seen": list(seen),
+            "sensors": list(SENSOR_CLASSES),
+            "values": list(set().union(*INCIDENT_VALUES.values())),
+        }
         with conn.transaction():
-            conn.execute("SET LOCAL statement_timeout = '30min'")
+            conn.execute("SET LOCAL statement_timeout = '10min'")
             with conn.cursor(name="incident_targets") as cur:
                 cur.itersize = 10_000
-                cur.execute(SELECT_LAST_TARGETS, params)
-                return cls({int(channel): (at, int(event_id))
-                            for channel, at, event_id in cur})
+                cur.execute(SELECT_SINCE_CHECKPOINT, params)
+                for channel, at, event_id, value, alarm, journal, sensor in cur:
+                    if is_target_alarm(sensor, value, alarm, journal):
+                        latest.mark(int(channel), at, int(event_id))
+        return latest

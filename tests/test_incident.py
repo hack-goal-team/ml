@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -21,15 +22,22 @@ def test_v4_500_artifact_is_pinned() -> None:
         (ROOT / "data/incident4/model_500.cbm").read_bytes()
     ).hexdigest()
     assert digest == "178c874ca373a5c48327d4a221379ea9ee166480385393425b96dd5002ce21f9"
+    seed = hashlib.sha256(
+        (ROOT / "data/incident4/target_seed.json").read_bytes()
+    ).hexdigest()
+    assert seed == "3161acd2ab38454f009aeb2b088ba53d7c673603ea9306aad7d5b4c87ae05deb"
 
 
 def test_incident_mapping_and_prior_target(tmp_path: Path) -> None:
     assert incident_class("КД АВ") == "INTRUSION"
     assert incident_class("Датчик дыма") == "FIRE"
     assert incident_class("Датчик температуры") is None
-    assert is_target_alarm("КД АВ", "Не замкнут", True)
-    assert not is_target_alarm("КД АВ", "Неисправен", True)
-    assert not is_target_alarm("КД АВ", "Не замкнут", False)
+    assert is_target_alarm("КД АВ", "Не замкнут", True, True)
+    assert not is_target_alarm("КД АВ", "Неисправен", True, True)
+    assert not is_target_alarm("КД АВ", "Не замкнут", True, False)
+    assert not is_target_alarm("КД АВ", "Норма", False)
+    with pytest.raises(RuntimeError, match="Original intrusion"):
+        is_target_alarm("КД АВ", "Не замкнут", True)
 
     now = datetime(2026, 9, 28, tzinfo=timezone.utc)
     history = TargetHistory()
@@ -63,8 +71,8 @@ def test_incident_runner_routes_and_caps_shap(db, tmp_path: Path) -> None:
     now = datetime.now(timezone.utc)
     with db.admin() as conn:
         conn.execute(
-            "INSERT INTO events (event_id, channel_id, ts, is_alarm, raw_value) "
-            "VALUES (10001, %s, %s, true, 'Не замкнут')",
+            "INSERT INTO events (event_id, channel_id, ts, is_alarm, raw_value, journal_is_alarm) "
+            "VALUES (10001, %s, %s, true, 'Не замкнут', true)",
             (CHANNEL, now - timedelta(hours=24)),
         )
 
@@ -77,10 +85,10 @@ def test_incident_runner_routes_and_caps_shap(db, tmp_path: Path) -> None:
                 value = "Не замкнут" if offset == 0 else "Норма"
                 alarm = offset == 0
                 admin.execute(
-                    "INSERT INTO events (event_id, channel_id, ts, is_alarm, raw_value) "
-                    "VALUES (%s, %s, %s, %s, %s)",
+                    "INSERT INTO events (event_id, channel_id, ts, is_alarm, raw_value, journal_is_alarm) "
+                    "VALUES (%s, %s, %s, %s, %s, %s)",
                     (event_id, CHANNEL, now + timedelta(seconds=offset),
-                     alarm, value),
+                     alarm, value, alarm),
                 )
         runner.tick(conn)
 
@@ -94,18 +102,12 @@ def test_incident_runner_routes_and_caps_shap(db, tmp_path: Path) -> None:
     runner.service.close()
 
 
-def test_history_ignores_excluded_2021(db) -> None:
-    with db.admin() as conn:
-        for event_id, year in [(20001, 2020), (20002, 2021)]:
-            conn.execute(
-                "INSERT INTO events (event_id, channel_id, ts, is_alarm, raw_value) "
-                "VALUES (%s, %s, %s, true, 'Не замкнут')",
-                (event_id, CHANNEL, datetime(year, 6, 1, tzinfo=timezone.utc)),
-            )
-        low = conn.execute("SELECT max(id) FROM events").fetchone()[0]
-    with db.inference() as conn:
-        history = TargetHistory.from_db(conn, low, set())
-    assert history.latest[CHANNEL][0].year == 2020
+def test_seed_excludes_2021() -> None:
+    seed = json.loads((ROOT / "data/incident4/target_seed.json").read_text())
+    assert seed["cutoff"] == "2026-07-01T00:00:00+03:00"
+    assert len(seed["latest"]) > 8000
+    assert all(datetime.fromisoformat(row[0]).year != 2021
+               for row in seed["latest"].values())
 
 
 def test_history_waits_for_alarm_backfill(db) -> None:
@@ -114,3 +116,30 @@ def test_history_waits_for_alarm_backfill(db) -> None:
     with db.inference() as conn:
         with pytest.raises(RuntimeError, match="alarm_backfill"):
             TargetHistory.from_db(conn, 0, set())
+
+
+def test_history_rejects_unrestored_intrusion_flag(db) -> None:
+    with db.admin() as conn:
+        conn.execute(
+            "INSERT INTO events (event_id, channel_id, ts, is_alarm, raw_value) "
+            "VALUES (30001, %s, %s, true, 'Обнаружено движение')",
+            (CHANNEL, datetime(2026, 9, 1, tzinfo=timezone.utc)),
+        )
+        low = conn.execute("SELECT max(id) FROM events").fetchone()[0]
+    with db.inference() as conn:
+        with pytest.raises(RuntimeError, match="Original intrusion"):
+            TargetHistory.from_db(conn, low, set())
+
+
+def test_history_uses_compact_checkpoint(db) -> None:
+    at = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    with db.admin() as conn:
+        conn.execute(
+            "UPDATE incident_history_checkpoint SET covered_until = %s, "
+            "targets = jsonb_build_object(%s::text, jsonb_build_array(%s::timestamptz, 12345)) "
+            "WHERE id = 1", (at + timedelta(days=1), str(CHANNEL), at),
+        )
+        low = conn.execute("SELECT coalesce(max(id), 0) FROM events").fetchone()[0]
+    with db.inference() as conn:
+        history = TargetHistory.from_db(conn, low, set())
+    assert history.hours_before(CHANNEL, at + timedelta(days=2)) == 48
