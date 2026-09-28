@@ -774,9 +774,9 @@ docker build -t inference:local .
 docker run --rm -v inference-runtime:/app/runtime -e PGHOST=... -e PGUSER=inference -e PGPASSWORD=... inference:local
 ```
 
-CI (`ci.yml`): `pytest` на Python 3.12 x86_64 со встроенным Postgres, `docker build`, smoke образа. Деплой (`deploy.yml`, push в `main` или вручную): после CI образ едет на VPS по SSH как `inference:current`, хранятся текущий и один предыдущий `inference:<sha>` для отката. Перед переключением сохраняются предыдущая модель, курсор и события за 72 часа в `~/backend/model-backups/before-full-no2021/` вместе с SHA-256; прежний образ получает тег `inference:rollback-before-full-no2021`. Новая версия прогревает окно из `events`, не из файла старой модели. При отказе healthcheck сценарий возвращает старый образ. Секреты: `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`.
+CI (`ci.yml`): `pytest` на Python 3.12 x86_64 со встроенным Postgres, `docker build`, smoke образа. Деплой (`deploy.yml`, push в `main` или вручную): после CI образ едет на VPS по SSH как `inference:current`, прежний `current` получает тег `inference:previous`. Перезапускаются все сервисы compose с именем `inference` или `inference-<суффикс>`, сценарий ждёт `healthy` у каждого. Новая версия прогревает окно из `events`. Если хоть один не поднялся, `inference:previous` снова становится `current` и все сервисы пересоздаются. Бэкап перед full-no2021 (`~/backend/model-backups/before-full-no2021/`, образ `inference:rollback-before-full-no2021`) не удаляется. Секреты: `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`.
 
-Ручной откат на VPS: `sudo docker tag inference:rollback-before-full-no2021 inference:current`, затем из `~/backend` выполнить `sudo docker compose up -d --no-deps inference` и дождаться `healthy`. Снимок событий нужен для разбора и возможной конвертации состояния; штатный прогрев читает события непосредственно из PostgreSQL.
+Ручной откат на VPS: `sudo docker tag inference:previous inference:current`, затем из `~/backend` выполнить `sudo docker compose up -d --no-deps --force-recreate inference` (и остальные `inference-*`) и дождаться `healthy`. Откат на модель до full-no2021: то же с тегом `inference:rollback-before-full-no2021`.
 
 Тесты: SQL-часть поднимает встроенный Postgres (`pgserver`) без Docker. Если пакета нет, эти тесты пропускаются.
 
