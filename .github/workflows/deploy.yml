@@ -21,7 +21,7 @@ jobs:
   deploy:
     needs: test
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 95
     env:
       IMAGE: inference:${{ github.sha }}
       REMOTE_DIR: backend
@@ -74,57 +74,24 @@ jobs:
           set -o pipefail
           docker save "$IMAGE" | gzip | ssh vps 'gunzip | sudo -n docker load'
 
-      - name: Preserve current model and 72-hour history
+      # Снимок курсора и 72-часовых входов должен завершиться до смены
+      # inference:current. При ошибке новый образ не запускается.
+      - name: Preserve equipment window
         run: |
-          ssh vps "REMOTE_DIR=$REMOTE_DIR bash -s" <<'EOF'
+          ssh vps "sudo -n env SHA=${{ github.sha }} REMOTE_DIR=\$HOME/$REMOTE_DIR bash -s" \
+            < deploy/backup-equipment-window.sh
+
+      # Прежний current — точка отката. Повторный прогон того же sha его
+      # не трогает, иначе previous совпал бы с новым образом.
+      - name: Tag previous
+        run: |
+          ssh vps "SHA=${{ github.sha }} bash -s" <<'EOF'
           set -euo pipefail
-          cd "$HOME/$REMOTE_DIR"
-          backup="$HOME/$REMOTE_DIR/model-backups/before-full-no2021"
-          umask 077
-          mkdir -p "$backup"
-          if [ -f "$backup/SHA256SUMS" ]; then
-            echo "existing model-switch backup verified"
-            cd "$backup"
-            sha256sum -c SHA256SUMS
-            exit 0
+          old=$(sudo -n docker image inspect -f '{{.Id}}' inference:current 2>/dev/null || true)
+          new=$(sudo -n docker image inspect -f '{{.Id}}' "inference:$SHA")
+          if [ -n "$old" ] && [ "$old" != "$new" ]; then
+            sudo -n docker tag inference:current inference:previous
           fi
-
-          sudo -n docker image inspect inference:current >/dev/null
-          sudo -n docker tag inference:current inference:rollback-before-full-no2021
-          sudo -n docker image inspect -f '{{.Id}}' inference:current > "$backup/previous-image-id.txt"
-
-          container=$(sudo -n docker compose ps -q inference)
-          created=0
-          if [ -z "$container" ]; then
-            container=$(sudo -n docker create inference:current)
-            created=1
-          fi
-          sudo -n docker cp "$container:/app/data/best_model.cbm" "$backup/previous_model.cbm.tmp"
-          if [ "$created" -eq 0 ]; then
-            sudo -n docker cp "$container:/app/runtime/events_cursor.json" "$backup/events_cursor.json.tmp"
-          else
-            sudo -n docker rm "$container" >/dev/null
-          fi
-          sudo -n chown "$USER" "$backup"/*.tmp
-          mv "$backup/previous_model.cbm.tmp" "$backup/previous_model.cbm"
-          if [ -f "$backup/events_cursor.json.tmp" ]; then
-            mv "$backup/events_cursor.json.tmp" "$backup/events_cursor.json"
-          fi
-
-          db=$(sed -n 's/^POSTGRES_DB=//p' .env)
-          dbuser=$(sed -n 's/^POSTGRES_USER=//p' .env)
-          sudo -n docker compose exec -T postgres psql -X -q -v ON_ERROR_STOP=1 \
-            -U "$dbuser" -d "$db" -c \
-            "COPY (SELECT id, event_id, channel_id, ts, is_alarm, raw_value FROM events WHERE ts >= now() - interval '72 hours' ORDER BY ts, id) TO STDOUT WITH (FORMAT csv, HEADER true)" \
-            | gzip -c > "$backup/events-72h.csv.gz.tmp"
-          mv "$backup/events-72h.csv.gz.tmp" "$backup/events-72h.csv.gz"
-          cd "$backup"
-          sha256sum previous_model.cbm previous-image-id.txt events-72h.csv.gz \
-            > SHA256SUMS
-          if [ -f events_cursor.json ]; then
-            sha256sum events_cursor.json >> SHA256SUMS
-          fi
-          sha256sum -c SHA256SUMS
           EOF
 
       # Стабильный тег, а не переменная в .env: деплой бэкенда переписывает
@@ -136,7 +103,7 @@ jobs:
           sudo -n docker tag "inference:$SHA" inference:current
           EOF
 
-      - name: Restart service
+      - name: Restart services
         run: |
           ssh vps "REMOTE_DIR=$REMOTE_DIR bash -s" <<'EOF'
           set -euo pipefail
@@ -144,62 +111,66 @@ jobs:
             echo "::notice::~/$REMOTE_DIR is missing: image loaded, nothing to restart"
             exit 0
           }
-          services=$(sudo -n docker compose config --services) || {
+          all=$(sudo -n docker compose config --services) || {
             echo "::error::docker compose config failed in ~/$REMOTE_DIR"
             exit 1
           }
-          # Сервис и гранты добавляет бэкенд (HACK-136). До него образ
-          # просто лежит на VPS и ничего не запускает.
-          if ! grep -qx inference <<<"$services"; then
-            echo "::notice::backend compose has no 'inference' service yet (HACK-136): image loaded, not started"
+          # Все сервисы на образе inference:current: модель поломок и
+          # 4-классовая. Сервисы и гранты добавляет бэкенд (HACK-136).
+          services=$(grep -xE 'inference(-[a-z0-9]+)?' <<<"$all" || true)
+          if [ -z "$services" ]; then
+            echo "::notice::backend compose has no inference services yet (HACK-136): image loaded, not started"
             exit 0
           fi
-          rollback() {
-            echo "::error::new inference failed; restoring previous image"
-            sudo -n docker tag inference:rollback-before-full-no2021 inference:current
-            sudo -n docker compose up -d --no-deps --force-recreate inference
-            rollback_deadline=$((SECONDS + 900))
-            while :; do
-              rollback_id=$(sudo -n docker compose ps -q inference)
-              rollback_status=$(sudo -n docker inspect -f '{{.State.Health.Status}}' "$rollback_id" 2>/dev/null || echo missing)
-              echo "rollback inference: $rollback_status"
-              [ "$rollback_status" = healthy ] && return 0
-              [ $SECONDS -ge $rollback_deadline ] && return 1
-              sleep 15
+          echo "services: $(tr '\n' ' ' <<<"$services")"
+
+          # Прогрев окон за 3 дня — минуты; ждём healthy, а не running.
+          wait_healthy() {
+            local deadline=$((SECONDS + 2100)) service id status
+            for service in $services; do
+              while :; do
+                id=$(sudo -n docker compose ps -q "$service")
+                status=$(sudo -n docker inspect -f '{{.State.Health.Status}}' "$id" 2>/dev/null || echo missing)
+                echo "$service: $status"
+                [ "$status" = healthy ] && break
+                if [ "$status" = unhealthy ] || [ $SECONDS -ge $deadline ]; then
+                  echo "::error::$service is not healthy ($status)"
+                  sudo -n docker compose logs --tail 200 "$service" || true
+                  return 1
+                fi
+                sleep 15
+              done
             done
           }
 
-          if ! sudo -n docker compose up -d --no-deps --force-recreate inference; then
-            rollback
+          rollback() {
+            if ! sudo -n docker image inspect inference:previous >/dev/null 2>&1; then
+              echo "::error::no inference:previous image, nothing to roll back to"
+              return 1
+            fi
+            echo "::error::new inference failed; restoring inference:previous"
+            sudo -n docker tag inference:previous inference:current
+            sudo -n docker compose up -d --no-deps --force-recreate $services
+            wait_healthy
+          }
+
+          if ! sudo -n docker compose up -d --no-deps --force-recreate $services || ! wait_healthy; then
+            rollback || true
             exit 1
           fi
-
-          # Прогрев окон за 3 дня — минуты; ждём healthy, а не running.
-          deadline=$((SECONDS + 900))
-          while :; do
-            id=$(sudo -n docker compose ps -q inference)
-            status=$(sudo -n docker inspect -f '{{.State.Health.Status}}' "$id" 2>/dev/null || echo missing)
-            echo "inference: $status"
-            [ "$status" = healthy ] && break
-            if [ "$status" = unhealthy ] || [ $SECONDS -ge $deadline ]; then
-              echo "::error::inference is not healthy ($status)"
-              sudo -n docker compose logs --tail 200 inference || true
-              rollback
-              exit 1
-            fi
-            sleep 15
+          for service in $services; do
+            sudo -n docker compose logs --tail 20 "$service"
           done
-          sudo -n docker compose logs --tail 20 inference
           EOF
 
-      # После рестарта: старый образ уже не держит контейнер. Хранятся текущий
-      # sha и один предыдущий для отката (образ 2.3 ГБ).
+      # После рестарта: старый образ уже не держит контейнер. Хранятся current,
+      # previous для отката и образ до full-no2021 (образ 2.3 ГБ).
       - name: Prune old images
         run: |
           ssh vps "SHA=${{ github.sha }} bash -s" <<'EOF'
           set -euo pipefail
           sudo -n docker image ls inference --format '{{.CreatedAt}}\t{{.Tag}}' \
-            | { grep -vP "\t(current|$SHA|rollback-before-full-no2021)\$" || true; } | sort -r | tail -n +2 | cut -f2 \
+            | { grep -vP "\t(current|previous|$SHA|rollback-before-full-no2021)\$" || true; } | cut -f2 \
             | while read -r tag; do sudo -n docker image rm "inference:$tag" >/dev/null || true; done
           sudo -n docker image prune -f >/dev/null
           EOF
