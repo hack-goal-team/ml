@@ -761,7 +761,7 @@ inference/
 
 Healthcheck `python -m inference.health`: флаг `ready` после прогрева и свежий `heartbeat`.
 
-Env (default): `INFERENCE_RUNTIME_DIR` (`runtime`, volume), `POLL_INTERVAL_SECONDS` (2), `EVENTS_BATCH_SIZE` (5000), `EVENTS_REORDER_LAG_SECONDS` (300), `TTL_INTERVAL_SECONDS` (60), `METADATA_REFRESH_SECONDS` (3600), `METADATA_RETRY_SECONDS` (600), `HEALTH_MAX_AGE_SECONDS` (120).
+Env (default): `INFERENCE_RUNTIME_DIR` (`runtime`, volume), `POLL_INTERVAL_SECONDS` (2), `EVENTS_BATCH_SIZE` (5000), `EVENTS_REORDER_LAG_SECONDS` (300), `TTL_INTERVAL_SECONDS` (60), `METADATA_REFRESH_SECONDS` (3600), `METADATA_RETRY_SECONDS` (600), `HEALTH_MAX_AGE_SECONDS` (120), `BACKFILL_HOURS` (0: выкл.; >0 — один раз на том runtime, маркер `backfill.done`, курсор отматывается на события за N часов и поток прогнозирует их заново).
 
 ### Docker и деплой
 

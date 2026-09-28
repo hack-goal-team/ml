@@ -109,6 +109,26 @@ def started(make_runner, db, **kwargs) -> tuple[Runner, psycopg.Connection]:
     return runner, conn
 
 
+def test_backfill_predicts_recent_events_once(db, make_runner) -> None:
+    ts = datetime.now(timezone.utc) - timedelta(hours=2)
+    with db.admin() as admin:
+        add_event(admin, CHANNEL, ts, "Неисправен")
+
+    # Без бэкфилла первый старт не прогнозирует уже лежащие события.
+    runner, conn = started(make_runner, db, threshold=0.0)
+    runner.tick(conn)
+    assert predictions(db) == []
+
+    runner, conn = started(make_runner, db, threshold=0.0, backfill_hours=3)
+    runner.tick(conn)
+    assert [row[1] for row in predictions(db)] == [str(CHANNEL)]
+
+    # Маркер в runtime: повторный старт окно заново не прогоняет.
+    runner, conn = started(make_runner, db, threshold=0.0, backfill_hours=3)
+    runner.tick(conn)
+    assert len(predictions(db)) == 1
+
+
 def test_tick_writes_prediction_rows(db, make_runner) -> None:
     runner, conn = started(make_runner, db, threshold=0.0)
     ts = datetime.now(timezone.utc) - timedelta(minutes=5)
