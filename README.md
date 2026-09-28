@@ -1,5 +1,8 @@
 # Moscow Hack 2026 — Prediction Service V2
 
+Повторное обучение модели описано в [retraining/README.md](retraining/README.md).
+Этот процесс запускается отдельно от сервиса прогноза и не заменяет его модель автоматически.
+
 Production-сервис для online-прогноза критического события по логам датчиков на произвольном положительном горизонте в часах.
 
 Модель: `CatBoostRegressor` с `SurvivalAft`.
@@ -750,7 +753,7 @@ inference/
 
 ### Цикл `python -m inference.runner`
 
-Старт: прогрев окон из `events` за 72 ч, pickle ядра не используется. Такт: новые строки `events` пачкой → один прогноз на лог (`channel`, `CHANNEL_EVENT`, `horizon_until = ts + 30 ч`) → запись пачки одной транзакцией. TTL удаляет истёкшие `catboost-aft-*` без решения диспетчера. Обрыв БД — reconnect с backoff.
+Старт: прогрев окон из `events` за 72 ч, pickle ядра не используется. Такт: новые строки `events` пачкой → один прогноз на лог (`channel`, `EQUIPMENT_FAILURE` у канала без класса инцидента, иначе `CHANNEL_EVENT`; `horizon_until = ts + 30 ч`) → запись пачки одной транзакцией. TTL удаляет истёкшие `catboost-aft-*` без решения диспетчера. Обрыв БД — reconnect с backoff.
 
 Пропуски и сбои считаются в строке `tick` раз в минуту: `skipped_stale`, `skipped_ooo`, `skipped_unknown`, `failed`, `failed_write_prep`.
 
@@ -764,12 +767,16 @@ Env (default): `INFERENCE_RUNTIME_DIR` (`runtime`, volume), `POLL_INTERVAL_SECON
 
 Образ: `python:3.11-slim`, `CMD python -m inference.runner`, `HEALTHCHECK python -m inference.health` (прогрев до 10 мин). Volume `/app/runtime` хранит курсор, без него рестарт теряет логи за простой.
 
+Модель `full-no2021-20260927` хранится в `data/best_model.cbm`. Рядом лежит `data/feature_encoding.json`: при запуске сервис сверяет порядок всех 105 входов с моделью и по значению `тип_инж_системы` из `dim_channels_current` рассчитывает семь числовых индикаторов. При отсутствии файла или расхождении схем сервис не стартует.
+
 ```bash
 docker build -t inference:local .
 docker run --rm -v inference-runtime:/app/runtime -e PGHOST=... -e PGUSER=inference -e PGPASSWORD=... inference:local
 ```
 
-CI (`ci.yml`): `pytest` со встроенным Postgres, `docker build`, smoke образа. Деплой (`deploy.yml`, push в `main` или вручную): после CI образ едет на VPS по SSH как `inference:current`, три прошлых `inference:<sha>` остаются для отката. Если в compose бэкенда есть сервис `inference`, он перезапускается и деплой ждёт `healthy`. Секреты: `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`.
+CI (`ci.yml`): `pytest` на Python 3.12 x86_64 со встроенным Postgres, `docker build`, smoke образа. Деплой (`deploy.yml`, push в `main` или вручную): после CI образ едет на VPS по SSH; перед сменой `inference:current` сохраняется [снимок окна оборудования](docs/equipment-window-snapshot.md). Прежний `current` получает тег `inference:previous`. Перезапускаются все сервисы compose с именем `inference` или `inference-<суффикс>`, сценарий ждёт `healthy` у каждого. Новая версия прогревает окно из `events`. Если хоть один не поднялся, `inference:previous` снова становится `current` и все сервисы пересоздаются. Бэкап перед full-no2021 (`~/backend/model-backups/before-full-no2021/`, образ `inference:rollback-before-full-no2021`) не удаляется. Секреты: `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`.
+
+Ручной откат на VPS: `sudo docker tag inference:previous inference:current`, затем из `~/backend` выполнить `sudo docker compose up -d --no-deps --force-recreate inference` (и остальные `inference-*`) и дождаться `healthy`. Откат на модель до full-no2021: то же с тегом `inference:rollback-before-full-no2021`.
 
 Тесты: SQL-часть поднимает встроенный Postgres (`pgserver`) без Docker. Если пакета нет, эти тесты пропускаются.
 
@@ -906,4 +913,3 @@ weather = get_weather(
 ```
 
 Именно такой словарь с названиями полей выше ожидает сервис модели для каждого необходимого часа (`current`, `+1h`, `+4h`, `+8h`, `+12h`, `+16h`, `+20h`, `+24h`).
-

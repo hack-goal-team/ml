@@ -21,7 +21,7 @@ jobs:
   deploy:
     needs: test
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 95
     env:
       IMAGE: inference:${{ github.sha }}
       REMOTE_DIR: backend
@@ -74,20 +74,38 @@ jobs:
           set -o pipefail
           docker save "$IMAGE" | gzip | ssh vps 'gunzip | sudo -n docker load'
 
+      # Снимок курсора и 72-часовых входов должен завершиться до смены
+      # inference:current. При ошибке новый образ не запускается.
+      - name: Preserve equipment window
+        run: |
+          result=$(ssh vps "sudo -n env SHA=${{ github.sha }} REMOTE_DIR=\$HOME/$REMOTE_DIR bash -s" \
+            < deploy/backup-equipment-window.sh)
+          printf '%s\n' "$result"
+          grep -Fq 'equipment window saved:' <<<"$result"
+
+      # Прежний current — точка отката. Повторный прогон того же sha его
+      # не трогает, иначе previous совпал бы с новым образом.
+      - name: Tag previous
+        run: |
+          ssh vps "SHA=${{ github.sha }} bash -s" <<'EOF'
+          set -euo pipefail
+          old=$(sudo -n docker image inspect -f '{{.Id}}' inference:current 2>/dev/null || true)
+          new=$(sudo -n docker image inspect -f '{{.Id}}' "inference:$SHA")
+          if [ -n "$old" ] && [ "$old" != "$new" ]; then
+            sudo -n docker tag inference:current inference:previous
+          fi
+          EOF
+
       # Стабильный тег, а не переменная в .env: деплой бэкенда переписывает
-      # ~/backend/.env целиком. inference:<sha> остаются для отката.
+      # ~/backend/.env целиком.
       - name: Tag current
         run: |
           ssh vps "SHA=${{ github.sha }} bash -s" <<'EOF'
           set -euo pipefail
           sudo -n docker tag "inference:$SHA" inference:current
-          # Храним три последних sha; image prune бэкенда их не трогает.
-          sudo -n docker image ls inference --format '{{.Tag}} {{.CreatedAt}}' \
-            | grep -Ev '^(current|<none>) ' | sort -k2 -r | awk 'NR > 3 {print $1}' \
-            | while read -r tag; do sudo -n docker image rm "inference:$tag" || true; done
           EOF
 
-      - name: Restart service
+      - name: Restart services
         run: |
           ssh vps "REMOTE_DIR=$REMOTE_DIR bash -s" <<'EOF'
           set -euo pipefail
@@ -95,31 +113,66 @@ jobs:
             echo "::notice::~/$REMOTE_DIR is missing: image loaded, nothing to restart"
             exit 0
           }
-          services=$(sudo -n docker compose config --services) || {
+          all=$(sudo -n docker compose config --services) || {
             echo "::error::docker compose config failed in ~/$REMOTE_DIR"
             exit 1
           }
-          # Сервис и гранты добавляет бэкенд (HACK-136). До него образ
-          # просто лежит на VPS и ничего не запускает.
-          if ! grep -qx inference <<<"$services"; then
-            echo "::notice::backend compose has no 'inference' service yet (HACK-136): image loaded, not started"
+          # Все сервисы на образе inference:current: модель поломок и
+          # 4-классовая. Сервисы и гранты добавляет бэкенд (HACK-136).
+          services=$(grep -xE 'inference(-[a-z0-9]+)?' <<<"$all" || true)
+          if [ -z "$services" ]; then
+            echo "::notice::backend compose has no inference services yet (HACK-136): image loaded, not started"
             exit 0
           fi
-          sudo -n docker compose up -d --no-deps inference
+          echo "services: $(tr '\n' ' ' <<<"$services")"
 
           # Прогрев окон за 3 дня — минуты; ждём healthy, а не running.
-          deadline=$((SECONDS + 900))
-          while :; do
-            id=$(sudo -n docker compose ps -q inference)
-            status=$(sudo -n docker inspect -f '{{.State.Health.Status}}' "$id" 2>/dev/null || echo missing)
-            echo "inference: $status"
-            [ "$status" = healthy ] && break
-            if [ "$status" = unhealthy ] || [ $SECONDS -ge $deadline ]; then
-              echo "::error::inference is not healthy ($status)"
-              sudo -n docker compose logs --tail 200 inference
-              exit 1
+          wait_healthy() {
+            local deadline=$((SECONDS + 2100)) service id status
+            for service in $services; do
+              while :; do
+                id=$(sudo -n docker compose ps -q "$service")
+                status=$(sudo -n docker inspect -f '{{.State.Health.Status}}' "$id" 2>/dev/null || echo missing)
+                echo "$service: $status"
+                [ "$status" = healthy ] && break
+                if [ "$status" = unhealthy ] || [ $SECONDS -ge $deadline ]; then
+                  echo "::error::$service is not healthy ($status)"
+                  sudo -n docker compose logs --tail 200 "$service" || true
+                  return 1
+                fi
+                sleep 15
+              done
+            done
+          }
+
+          rollback() {
+            if ! sudo -n docker image inspect inference:previous >/dev/null 2>&1; then
+              echo "::error::no inference:previous image, nothing to roll back to"
+              return 1
             fi
-            sleep 15
+            echo "::error::new inference failed; restoring inference:previous"
+            sudo -n docker tag inference:previous inference:current
+            sudo -n docker compose up -d --no-deps --force-recreate $services
+            wait_healthy
+          }
+
+          if ! sudo -n docker compose up -d --no-deps --force-recreate $services || ! wait_healthy; then
+            rollback || true
+            exit 1
+          fi
+          for service in $services; do
+            sudo -n docker compose logs --tail 20 "$service"
           done
-          sudo -n docker compose logs --tail 20 inference
+          EOF
+
+      # После рестарта: старый образ уже не держит контейнер. Хранятся current,
+      # previous для отката и образ до full-no2021 (образ 2.3 ГБ).
+      - name: Prune old images
+        run: |
+          ssh vps "SHA=${{ github.sha }} bash -s" <<'EOF'
+          set -euo pipefail
+          sudo -n docker image ls inference --format '{{.CreatedAt}}\t{{.Tag}}' \
+            | { grep -vP "\t(current|previous|$SHA|rollback-before-full-no2021)\$" || true; } | cut -f2 \
+            | while read -r tag; do sudo -n docker image rm "inference:$tag" >/dev/null || true; done
+          sudo -n docker image prune -f >/dev/null
           EOF

@@ -99,13 +99,13 @@ def test_prediction_on_postgres_sources(pg, tmp_path: Path) -> None:
         )
         conn.execute(
             "INSERT INTO dim_channels VALUES "
-            "(120578, %s, 'Охранная', 'КД АВ', '15-11.1.131.2.', 'КД АВ', 20)",
+            "(120578, %s, 'Охранная подсистема', 'КД АВ', '15-11.1.131.2.', 'КД АВ', 20)",
             (snapshot,),
         )
         conn.execute(
             "INSERT INTO weather (district_id, valid_for, fetched_at, "
-            "is_forecast, temperature_c) VALUES (5773, %s, %s, false, 9.75)",
-            (datetime(2026, 9, 24, 11, 15, tzinfo=timezone.utc), event_ts),
+            "is_forecast, temperature_c) VALUES (5773, %s, %s, true, 9.75)",
+            (datetime(2026, 9, 24, 15, tzinfo=timezone.utc), event_ts),
         )
 
     service = build_service(settings, connect=pg.inference)
@@ -114,8 +114,7 @@ def test_prediction_on_postgres_sources(pg, tmp_path: Path) -> None:
         assert isinstance(service.weather_client, PgWeatherClient)
         assert service.metadata == {
             120578: {
-                "тип_датчика": "КД АВ",
-                "тег_инженерной_системы": "15",
+                "тип_инж_системы": "Охранная подсистема",
                 "родитель": 5773,
             }
         }
@@ -139,9 +138,9 @@ def test_prediction_on_postgres_sources(pg, tmp_path: Path) -> None:
             datetime(2026, 9, 24, 14, 37, 15),
         )
         names = service.feature_names
-        current = row[names.index("temperature_2m (°C)__future_current")]
-        ahead = row[names.index("temperature_2m (°C)__future_1h")]
-        assert current == float(Decimal("9.75"))
-        assert math.isnan(ahead)
+        ahead = row[names.index("temperature_2m (°C)__future_4h")]
+        later = row[names.index("temperature_2m (°C)__future_8h")]
+        assert ahead == float(Decimal("9.75"))
+        assert math.isnan(later)
     finally:
         service.close()

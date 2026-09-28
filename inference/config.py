@@ -26,15 +26,15 @@ CONNECT_KWARGS = dict(
 STATEMENT_TIMEOUT = "-c statement_timeout=30s"
 
 
-def model_version(model_path: Path) -> str:
-    """catboost-aft-<первые 12 hex sha256 файла модели>."""
+def model_version(model_path: Path, prefix: str = "catboost-aft-") -> str:
+    """Версия по SHA-256 модели с префиксом семейства прогнозов."""
     digest = hashlib.sha256()
 
     with model_path.open("rb") as file:
         for chunk in iter(lambda: file.read(1 << 20), b""):
             digest.update(chunk)
 
-    return f"catboost-aft-{digest.hexdigest()[:12]}"
+    return f"{prefix}{digest.hexdigest()[:12]}"
 
 
 @dataclass(slots=True, frozen=True)
@@ -54,6 +54,7 @@ class InferenceSettings:
 
     # Пишется в prediction_log.model_version.
     model_version: str
+    prediction_kind: str = "EQUIPMENT"
 
     @classmethod
     def from_env(
@@ -77,6 +78,12 @@ class InferenceSettings:
 
         district = env.get("WEATHER_DISTRICT_ID")
 
+        prediction_kind = env.get("PREDICTION_KIND", "EQUIPMENT").upper()
+        if prediction_kind not in {"EQUIPMENT", "INCIDENT"}:
+            raise ValueError("PREDICTION_KIND must be EQUIPMENT or INCIDENT")
+        prefix = ("incident4-v4-" if prediction_kind == "INCIDENT"
+                  else "catboost-aft-")
+
         return cls(
             service=service,
             horizon_hours=normalize_horizon_hours(
@@ -91,8 +98,9 @@ class InferenceSettings:
             ),
             model_version=(
                 env.get("MODEL_VERSION")
-                or model_version(service.model_path)
+                or model_version(service.model_path, prefix)
             ),
+            prediction_kind=prediction_kind,
         )
 
 

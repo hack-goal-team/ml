@@ -3,3 +3,5 @@ data/ext-journal-2026.parquet
 __pycache__/
 .pytest_cache/
 runtime/
+tests/backtest/results/predictions.csv
+tests/backtest/results/test_channels.csv

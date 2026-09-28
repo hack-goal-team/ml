@@ -26,12 +26,14 @@ RUN useradd --system --uid 10001 --no-create-home inference \
 COPY app.py config.yml ./
 COPY inference/ inference/
 COPY data/best_model.cbm data/best_model.cbm
+COPY data/incident4/ data/incident4/
+COPY data/feature_encoding.json data/feature_encoding.json
 
 USER inference
 VOLUME /app/runtime
 
 # start-period покрывает загрузку модели и прогрев окон за 3 дня.
-HEALTHCHECK --interval=30s --timeout=10s --start-period=10m --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=35m --retries=3 \
     CMD ["python", "-m", "inference.health"]
 
 CMD ["python", "-m", "inference.runner"]

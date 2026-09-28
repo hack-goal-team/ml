@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
 import pickle
@@ -393,6 +394,8 @@ WEATHER_RE = re.compile(
     r"(?P<horizon>current|\d+(?:\.\d+)?[hdm])$"
 )
 
+ENCODED_CATEGORY_RE = re.compile(r"^(?P<name>.+)__cat_(?P<index>\d+)$")
+
 
 def period_seconds(value: str) -> int:
     if value == "current":
@@ -416,6 +419,7 @@ class FeatureSpec:
     kind: str
     name: str | None = None
     seconds: int = 0
+    level: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -431,8 +435,10 @@ class CompiledModelFeatures:
 
 def compile_model_features(
     feature_names: Iterable[str],
+    category_levels: Mapping[str, list[str]] | None = None,
 ) -> CompiledModelFeatures:
     names = tuple(feature_names)
+    category_levels = category_levels or {}
     specs: list[FeatureSpec] = []
     rolling_windows: set[int] = set()
     categories_by_window: dict[int, set[str]] = {}
@@ -441,6 +447,18 @@ def compile_model_features(
     weather_offsets_seconds: set[int] = set()
 
     for feature in names:
+        encoded_match = ENCODED_CATEGORY_RE.match(feature)
+        if encoded_match:
+            name = encoded_match.group("name")
+            index = int(encoded_match.group("index"))
+            levels = category_levels.get(name)
+            if levels is None or index >= len(levels):
+                raise ValueError(f"No encoding for model feature {feature!r}")
+            specs.append(FeatureSpec(kind="one_hot", name=name, level=levels[index]))
+            if name not in static_features:
+                static_features.append(name)
+            continue
+
         cat_match = CAT_RE.match(feature)
 
         if cat_match:
@@ -508,6 +526,10 @@ def compile_model_features(
             specs.append(
                 FeatureSpec(kind="day_of_week")
             )
+            continue
+
+        if feature == "hours_since_prev_target":
+            specs.append(FeatureSpec(kind="prev_target"))
             continue
 
         specs.append(
@@ -1201,9 +1223,26 @@ class PredictionService:
             self.model.feature_names_
         )
 
+        encoding_path = config.model_path.with_name("feature_encoding.json")
+        category_levels: dict[str, list[str]] = {}
+        if encoding_path.exists():
+            encoding = json.loads(encoding_path.read_text(encoding="utf-8"))
+            category_levels = encoding["levels"]
+            expected: list[str] = []
+            for name in encoding["features"]:
+                if name in category_levels:
+                    expected.extend(
+                        f"{name}__cat_{index}"
+                        for index in range(len(category_levels[name]))
+                    )
+                else:
+                    expected.append(name)
+            if tuple(expected) != self.feature_names:
+                raise ValueError("Feature encoding does not match the model")
+
         self.compiled = (
             compile_model_features(
-                self.feature_names
+                self.feature_names, category_levels
             )
         )
 
@@ -1330,6 +1369,7 @@ class PredictionService:
         self,
         sensor_id: int,
         at: datetime,
+        hours_since_prev_target: float | None = None,
     ) -> list[Any]:
         if (
             sensor_id
@@ -1478,6 +1518,15 @@ class PredictionService:
                     at.isoweekday()
                 )
 
+            elif spec.kind == "prev_target":
+                value = hours_since_prev_target
+
+            elif spec.kind == "one_hot":
+                source = metadata[spec.name]
+                value = int(
+                    ("null" if source is None else str(source)) == spec.level
+                )
+
             else:
                 if (
                     spec.name
@@ -1518,6 +1567,7 @@ class PredictionService:
         row: list[Any],
         raw_prediction: float,
         horizon_hours: float,
+        top_n: int = 10,
     ) -> dict[str, Any]:
         started = (
             time.perf_counter()
@@ -1570,7 +1620,7 @@ class PredictionService:
                 )
             ),
             reverse=True,
-        )[:10]
+        )[:top_n]
 
         top = []
 
@@ -1749,6 +1799,9 @@ class PredictionService:
                 self._build_feature_row(
                     sensor_id=sensor_id,
                     at=timestamp,
+                    hours_since_prev_target=payload.get(
+                        "hours_since_prev_target"
+                    ),
                 )
             )
 
@@ -1833,6 +1886,7 @@ class PredictionService:
                         horizon_hours=(
                             horizon_hours
                         ),
+                        top_n=(11 if payload.get("_incident_report") else 10),
                     )
                 )
 

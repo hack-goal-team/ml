@@ -24,6 +24,9 @@ from inference.config import InferenceSettings
 from inference.config import connect as pg_connect
 from inference.cursor import EventCursor
 from inference.health import HEARTBEAT_FILE, READY_FILE
+from inference.incident import (
+    TargetHistory, classed_channels, incident_class, is_target_alarm,
+)
 from inference.predictions import (
     PredictionRow,
     delete_expired,
@@ -38,6 +41,7 @@ from inference.timeutil import to_model_fields, to_model_time
 log = logging.getLogger("inference")
 
 CURSOR_FILE = "events_cursor.json"
+TARGETS_FILE = "incident_targets.json"
 
 SELECT_MAX_ID = "SELECT coalesce(max(id), 0) FROM events"
 
@@ -52,7 +56,7 @@ SELECT_WARMUP = """
 
 # Фильтр по ts отсекает старые партиции и импорт истории вне окон.
 SELECT_NEW = """
-    SELECT id, channel_id, ts, raw_value FROM events
+    SELECT id, channel_id, ts, raw_value, is_alarm, {journal_alarm} FROM events
     WHERE ts >= %(since)s AND id > %(low)s
       AND id <> ALL(%(seen)s::bigint[])
     ORDER BY id
@@ -74,6 +78,8 @@ class RunnerSettings:
     metadata_refresh_seconds: float = 3600.0
     metadata_retry_seconds: float = 600.0
     backoff_max_seconds: float = 60.0
+    shap_max_per_tick: int = 8
+    shap_budget_ms: float = 500.0
 
     @classmethod
     def from_env(
@@ -94,6 +100,8 @@ class RunnerSettings:
             metadata_retry_seconds=_env_float(
                 env, "METADATA_RETRY_SECONDS", 600.0
             ),
+            shap_max_per_tick=int(env.get("SHAP_MAX_PER_TICK") or 8),
+            shap_budget_ms=_env_float(env, "SHAP_BUDGET_MS", 500.0),
         )
 
 
@@ -107,6 +115,8 @@ class TickCounters:
     failed: int = 0
     failed_write_prep: int = 0
     shap: int = 0
+    shap_skipped: int = 0
+    skipped_nonincident: int = 0
     expired: int = 0
     write_ms: float = 0.0
     lag_seconds: float | None = None
@@ -127,6 +137,8 @@ class EventRow:
     channel_id: int
     ts: datetime
     raw_value: str
+    is_alarm: bool
+    journal_is_alarm: bool | None
 
 
 def utcnow() -> datetime:
@@ -166,6 +178,9 @@ class Runner:
         self._ttl_at = float("-inf")
         self.totals = TickCounters()
         self.last_tick = TickCounters()
+        self.targets: TargetHistory | None = None
+        self.classed: frozenset[int] = frozenset()
+        self._tick_shap_ms = 0.0
         self._logged_at = float("-inf")
         self._traceback_at = float("-inf")
 
@@ -202,6 +217,15 @@ class Runner:
                     low, lag_seconds=self.options.reorder_lag_seconds
                 )
             rows = self._warmup(conn, service, cursor)
+            self.classed = classed_channels(conn)
+            if self.settings.prediction_kind == "INCIDENT":
+                self.targets = TargetHistory.load(
+                    self.path(TARGETS_FILE), cursor.low, cursor.seen
+                )
+                if self.targets is None:
+                    self.targets = TargetHistory.from_db(
+                        conn, cursor.low, cursor.seen
+                    )
         except BaseException:
             service.close()
             raise
@@ -213,6 +237,8 @@ class Runner:
         self.cursor = cursor
         self._metadata_at = self.monotonic()
         cursor.save(self.path(CURSOR_FILE))
+        if self.targets is not None:
+            self.targets.save(self.path(TARGETS_FILE), cursor.low, cursor.seen)
         self.path(READY_FILE).touch()
         log.info(
             "started fresh=%s low=%d seen=%d warmup_rows=%d channels=%d "
@@ -260,6 +286,7 @@ class Runner:
         """Один проход; True — страница полная, читать дальше без паузы."""
         assert self.service is not None and self.cursor is not None
         counters = TickCounters(ticks=1)
+        self._tick_shap_ms = 0.0
 
         # Прогнозы прошлого такта, не записанные из-за сбоя БД.
         counters.write_ms += self._flush(conn)
@@ -271,7 +298,9 @@ class Runner:
             self._reload_metadata(conn, "periodic")
 
         if self.monotonic() - self._ttl_at >= self.options.ttl_interval_seconds:
-            counters.expired = delete_expired(conn, self.settings.model_version)
+            counters.expired = delete_expired(
+                conn, self.settings.model_version, self.settings.prediction_kind
+            )
             self._ttl_at = self.monotonic()
 
         events = self._fetch(conn)
@@ -290,6 +319,10 @@ class Runner:
         self.cursor.advance(self.monotonic())
         if self.cursor.dirty:
             self.cursor.save(self.path(CURSOR_FILE))
+            if self.targets is not None:
+                self.targets.save(
+                    self.path(TARGETS_FILE), self.cursor.low, self.cursor.seen
+                )
 
         self.last_tick = counters
         self._log_tick(counters)
@@ -297,8 +330,11 @@ class Runner:
 
     def _fetch(self, conn: psycopg.Connection) -> list[EventRow]:
         assert self.cursor is not None
+        journal_alarm = (
+            "journal_is_alarm" if self.targets is not None else "NULL::boolean"
+        )
         rows = conn.execute(
-            SELECT_NEW,
+            SELECT_NEW.format(journal_alarm=journal_alarm),
             {
                 "since": self.clock() - self.window,
                 "low": self.cursor.low,
@@ -330,6 +366,25 @@ class Runner:
                 counters.skipped_unknown += 1
                 return
 
+        sensor_type = service.metadata[event.channel_id].get("тип_датчика")
+        target_alarm = False
+        previous_hours = None
+        # Модель поломок прогнозирует любую тревогу: на канале без класса это
+        # отказ оборудования, на канале с классом — смесь с инцидентом, её
+        # не выдаём за отказ. Тип датчика берём из реестра: в фичах его нет.
+        incident = ("CHANNEL_EVENT" if event.channel_id in self.classed
+                    else "EQUIPMENT_FAILURE")
+        if self.targets is not None:
+            incident = incident_class(sensor_type)
+            if incident is None:
+                counters.skipped_nonincident += 1
+                return
+            target_alarm = is_target_alarm(
+                sensor_type, event.raw_value, event.is_alarm,
+                event.journal_is_alarm,
+            )
+            previous_hours = self.targets.hours_before(event.channel_id, event.ts)
+
         horizon_until = event.ts + self.horizon
 
         if horizon_until < now:
@@ -344,10 +399,17 @@ class Runner:
                     )
                 except ValueError:
                     pass
+            if target_alarm:
+                self.targets.mark(event.channel_id, event.ts, event.id)
             return
 
         date_value, time_value = to_model_fields(event.ts)
         try:
+            shap_allowed = (
+                self.targets is None
+                or (counters.shap < self.options.shap_max_per_tick
+                    and self._tick_shap_ms < self.options.shap_budget_ms)
+            )
             result = service.predict(
                 {
                     ID_COL: event.channel_id,
@@ -355,7 +417,9 @@ class Runner:
                     TIME_COL: time_value,
                     VALUE_COL: event.raw_value,
                     HORIZON_HOURS_FIELD: self.settings.horizon_hours,
-                    "add_shap": "auto",
+                    "add_shap": "auto" if shap_allowed else "none",
+                    "hours_since_prev_target": previous_hours,
+                    "_incident_report": self.targets is not None,
                 }
             )
         except KeyError:
@@ -370,18 +434,28 @@ class Runner:
             self._log_failure("predict", event.id)
             counters.failed += 1
             return
+        finally:
+            if target_alarm:
+                self.targets.mark(event.channel_id, event.ts, event.id)
+
+        shap = result.get("shap")
+        if shap is not None:
+            self._tick_shap_ms += float(shap.get("calculation_ms", 0.0))
+        elif not shap_allowed and result["probability"] > service.config.shap_auto_threshold:
+            counters.shap_skipped += 1
 
         # Отдельно от predict: сломанный формат ответа ядра (NaN, новое
         # имя ключа shap) — наш сбой, а не пропуск unknown/ooo.
         try:
-            shap = result.get("shap")
             row = PredictionRow(
                 channel_id=event.channel_id,
                 probability=to_probability(result["probability"]),
                 horizon_until=horizon_until,
                 shap=None if shap is None else shap_contract(
-                    shap, self._cat_features(service)
+                    shap, self._cat_features(service),
+                    top_n=11 if self.targets is not None else 10,
                 ),
+                incident_type=incident,
             )
         except Exception:  # noqa: BLE001
             self._log_failure("write_prep", event.id)
@@ -419,6 +493,7 @@ class Runner:
         service = self.service
         assert service is not None
         metadata = fetch_metadata(conn, service.compiled.static_features)
+        self.classed = classed_channels(conn)
 
         # Rolling-state не трогаем: меняется только справочная часть.
         with service.lock:
@@ -490,6 +565,10 @@ class Runner:
             if conn is not None and not conn.closed and self.cursor is not None:
                 self._flush(conn)
                 self.cursor.save(self.path(CURSOR_FILE))
+                if self.targets is not None:
+                    self.targets.save(
+                        self.path(TARGETS_FILE), self.cursor.low, self.cursor.seen
+                    )
         except psycopg.Error as exc:
             # Не записанные строки пересчитаются после рестарта.
             log.warning("final flush failed: %s", exc)
