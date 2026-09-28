@@ -78,8 +78,10 @@ jobs:
       # inference:current. При ошибке новый образ не запускается.
       - name: Preserve equipment window
         run: |
-          ssh vps "sudo -n env SHA=${{ github.sha }} REMOTE_DIR=\$HOME/$REMOTE_DIR bash -s" \
-            < deploy/backup-equipment-window.sh
+          result=$(ssh vps "sudo -n env SHA=${{ github.sha }} REMOTE_DIR=\$HOME/$REMOTE_DIR bash -s" \
+            < deploy/backup-equipment-window.sh)
+          printf '%s\n' "$result"
+          grep -Fq 'equipment window saved:' <<<"$result"
 
       # Прежний current — точка отката. Повторный прогон того же sha его
       # не трогает, иначе previous совпал бы с новым образом.

@@ -10,12 +10,12 @@ backup_mount=${BACKUP_MOUNT:-/mnt/backups}
 mountpoint -q "$backup_mount" || { echo "$backup_mount is not mounted" >&2; exit 1; }
 cd "${REMOTE_DIR:-$HOME/backend}"
 
-services=$(docker compose config --services)
+services=$(docker compose config --services </dev/null)
 if ! grep -qx inference <<<"$services"; then
   echo 'equipment inference is not configured; window cannot be preserved' >&2
   exit 1
 fi
-container=$(docker compose ps -q inference)
+container=$(docker compose ps -q inference </dev/null)
 [[ -n $container ]] || { echo 'equipment inference container is missing' >&2; exit 1; }
 [[ $(docker inspect -f '{{.State.Running}}' "$container") == true ]] || {
   echo 'equipment inference is not running' >&2
@@ -53,7 +53,7 @@ cleanup() {
   local result=$?
   trap - EXIT
   if (( stopped )); then
-    if ! docker compose start inference || ! verify_old_running; then
+  if ! docker compose start inference </dev/null || ! verify_old_running; then
       echo 'CRITICAL: old equipment inference did not recover after backup failure' >&2
       result=1
     fi
@@ -88,28 +88,28 @@ verify_old_running() {
 
 # Stop before copying the cursor so it matches a completed batch.
 stopped=1
-docker compose stop inference
+docker compose stop inference </dev/null
 snapshot_at=$(date -u +%Y-%m-%dT%H:%M:%S.%NZ)
-docker cp "$container:/app/runtime/." - > "$tmp/runtime.tar"
-docker cp "$container:/app/data/best_model.cbm" "$tmp/equipment_model.cbm"
-docker cp "$container:/app/data/feature_encoding.json" "$tmp/feature_encoding.json"
-docker cp "$container:/app/config.yml" "$tmp/config.yml"
+docker cp "$container:/app/runtime/." - > "$tmp/runtime.tar" </dev/null
+docker cp "$container:/app/data/best_model.cbm" "$tmp/equipment_model.cbm" </dev/null
+docker cp "$container:/app/data/feature_encoding.json" "$tmp/feature_encoding.json" </dev/null
+docker cp "$container:/app/config.yml" "$tmp/config.yml" </dev/null
 tar -tf "$tmp/runtime.tar" > /dev/null
-docker compose start inference
+docker compose start inference </dev/null
 stopped=0
 [[ $(docker inspect -f '{{.State.Running}}' "$container") == true ]] || {
   echo 'equipment inference failed to restart after snapshot' >&2
   exit 1
 }
 
-db=$(docker compose exec -T postgres printenv POSTGRES_DB | tr -d '\r')
-dbuser=$(docker compose exec -T postgres printenv POSTGRES_USER | tr -d '\r')
+db=$(docker compose exec -T postgres printenv POSTGRES_DB </dev/null | tr -d '\r')
+dbuser=$(docker compose exec -T postgres printenv POSTGRES_USER </dev/null | tr -d '\r')
 [[ -n $db && -n $dbuser ]] || { echo 'database name/user missing' >&2; exit 1; }
 copy_query() {
   local query=$1 destination=$2
   docker compose exec -T postgres \
     psql -X -q -v ON_ERROR_STOP=1 -U "$dbuser" -d "$db" \
-    -c "COPY ($query) TO STDOUT WITH (FORMAT csv, HEADER true)" \
+    -c "COPY ($query) TO STDOUT WITH (FORMAT csv, HEADER true)" </dev/null \
     | gzip -1 > "$tmp/$destination"
   gzip -t "$tmp/$destination"
 }
