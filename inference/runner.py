@@ -24,7 +24,9 @@ from inference.config import InferenceSettings
 from inference.config import connect as pg_connect
 from inference.cursor import EventCursor
 from inference.health import HEARTBEAT_FILE, READY_FILE
-from inference.incident import TargetHistory, incident_class, is_target_alarm
+from inference.incident import (
+    TargetHistory, classed_channels, incident_class, is_target_alarm,
+)
 from inference.predictions import (
     PredictionRow,
     delete_expired,
@@ -177,6 +179,7 @@ class Runner:
         self.totals = TickCounters()
         self.last_tick = TickCounters()
         self.targets: TargetHistory | None = None
+        self.classed: frozenset[int] = frozenset()
         self._tick_shap_ms = 0.0
         self._logged_at = float("-inf")
         self._traceback_at = float("-inf")
@@ -214,6 +217,7 @@ class Runner:
                     low, lag_seconds=self.options.reorder_lag_seconds
                 )
             rows = self._warmup(conn, service, cursor)
+            self.classed = classed_channels(conn)
             if self.settings.prediction_kind == "INCIDENT":
                 self.targets = TargetHistory.load(
                     self.path(TARGETS_FILE), cursor.low, cursor.seen
@@ -365,7 +369,11 @@ class Runner:
         sensor_type = service.metadata[event.channel_id].get("тип_датчика")
         target_alarm = False
         previous_hours = None
-        incident = "CHANNEL_EVENT"
+        # Модель поломок прогнозирует любую тревогу: на канале без класса это
+        # отказ оборудования, на канале с классом — смесь с инцидентом, её
+        # не выдаём за отказ. Тип датчика берём из реестра: в фичах его нет.
+        incident = ("CHANNEL_EVENT" if event.channel_id in self.classed
+                    else "EQUIPMENT_FAILURE")
         if self.targets is not None:
             incident = incident_class(sensor_type)
             if incident is None:
@@ -485,6 +493,7 @@ class Runner:
         service = self.service
         assert service is not None
         metadata = fetch_metadata(conn, service.compiled.static_features)
+        self.classed = classed_channels(conn)
 
         # Rolling-state не трогаем: меняется только справочная часть.
         with service.lock:

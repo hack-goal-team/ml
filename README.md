@@ -753,7 +753,7 @@ inference/
 
 ### Цикл `python -m inference.runner`
 
-Старт: прогрев окон из `events` за 72 ч, pickle ядра не используется. Такт: новые строки `events` пачкой → один прогноз на лог (`channel`, `CHANNEL_EVENT`, `horizon_until = ts + 30 ч`) → запись пачки одной транзакцией. TTL удаляет истёкшие `catboost-aft-*` без решения диспетчера. Обрыв БД — reconnect с backoff.
+Старт: прогрев окон из `events` за 72 ч, pickle ядра не используется. Такт: новые строки `events` пачкой → один прогноз на лог (`channel`, `EQUIPMENT_FAILURE` у канала без класса инцидента, иначе `CHANNEL_EVENT`; `horizon_until = ts + 30 ч`) → запись пачки одной транзакцией. TTL удаляет истёкшие `catboost-aft-*` без решения диспетчера. Обрыв БД — reconnect с backoff.
 
 Пропуски и сбои считаются в строке `tick` раз в минуту: `skipped_stale`, `skipped_ooo`, `skipped_unknown`, `failed`, `failed_write_prep`.
 

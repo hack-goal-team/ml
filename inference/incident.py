@@ -52,6 +52,15 @@ SELECT_SINCE_CHECKPOINT = """
 """
 
 
+def classed_channels(conn: psycopg.Connection) -> frozenset[int]:
+    """Каналы с классом инцидента — по реестру, а не по фичам модели."""
+    rows = conn.execute(
+        "SELECT channel_id FROM dim_channels_current WHERE sensor_type = ANY(%s)",
+        (list(SENSOR_CLASSES),),
+    ).fetchall()
+    return frozenset(int(row[0]) for row in rows)
+
+
 def incident_class(sensor_type: str | None) -> str | None:
     return SENSOR_CLASSES.get(sensor_type)
 
