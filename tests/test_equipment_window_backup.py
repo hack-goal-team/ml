@@ -23,7 +23,9 @@ def _mock_tools(tmp_path: Path) -> Path:
 set -eu
 printf '%s\\n' "$*" >> "$MOCK_LOG"
 case "$*" in
-  'compose config --services') printf 'postgres\\ninference\\n' ;;
+  'compose config --services')
+    if [ "${MOCK_NO_INFERENCE:-0}" = 1 ]; then echo postgres;
+    else printf 'postgres\\ninference\\n'; fi ;;
   'compose ps -q inference') echo old-container ;;
   'inspect -f {{.State.Running}} old-container') echo true ;;
   'inspect -f {{range .Mounts}}{{if eq .Destination "/app/runtime"}}{{.Name}}{{end}}{{end}} old-container') echo backend_inference-runtime ;;
@@ -51,8 +53,8 @@ esac
     return bin_dir
 
 
-def _run(tmp_path: Path, fail_copy: bool = False,
-         fail_start: bool = False) -> tuple[subprocess.CompletedProcess[str], Path]:
+def _run(tmp_path: Path, fail_copy: bool = False, fail_start: bool = False,
+         no_inference: bool = False) -> tuple[subprocess.CompletedProcess[str], Path]:
     bin_dir = _mock_tools(tmp_path)
     runtime = tmp_path / "runtime"
     runtime.mkdir()
@@ -74,6 +76,7 @@ def _run(tmp_path: Path, fail_copy: bool = False,
         "MOCK_LOG": str(log),
         "MOCK_FAIL_CP": "1" if fail_copy else "0",
         "MOCK_FAIL_START": "1" if fail_start else "0",
+        "MOCK_NO_INFERENCE": "1" if no_inference else "0",
     }
     result = subprocess.run(["bash", str(SCRIPT)], env=env, text=True,
                             capture_output=True, check=False)
@@ -114,4 +117,11 @@ def test_failed_restart_reports_old_service_unavailable(tmp_path: Path) -> None:
     result, backup = _run(tmp_path, fail_start=True)
     assert result.returncode != 0
     assert "CRITICAL: old equipment inference did not recover" in result.stderr
+    assert not list((backup / "inference-windows").glob("equipment-*"))
+
+
+def test_missing_equipment_service_blocks_image_switch(tmp_path: Path) -> None:
+    result, backup = _run(tmp_path, no_inference=True)
+    assert result.returncode != 0
+    assert "window cannot be preserved" in result.stderr
     assert not list((backup / "inference-windows").glob("equipment-*"))

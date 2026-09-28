@@ -12,8 +12,8 @@ cd "${REMOTE_DIR:-$HOME/backend}"
 
 services=$(docker compose config --services)
 if ! grep -qx inference <<<"$services"; then
-  echo '::notice::equipment inference is not configured; no window to preserve'
-  exit 0
+  echo 'equipment inference is not configured; window cannot be preserved' >&2
+  exit 1
 fi
 container=$(docker compose ps -q inference)
 [[ -n $container ]] || { echo 'equipment inference container is missing' >&2; exit 1; }
