@@ -29,7 +29,12 @@ case "$*" in
   'compose ps -q inference') echo old-container ;;
   'inspect -f {{.State.Running}} old-container') echo true ;;
   'inspect -f {{range .Mounts}}{{if eq .Destination "/app/runtime"}}{{.Name}}{{end}}{{end}} old-container') echo backend_inference-runtime ;;
-  'inspect -f {{.State.Health.Status}} old-container') echo healthy ;;
+  'inspect -f {{.State.Health.Status}} old-container')
+    if [ "${MOCK_SCHEMA_ERROR:-0}" = 1 ]; then echo starting;
+    else echo healthy; fi ;;
+  'logs --tail 100 old-container')
+    if [ "${MOCK_SCHEMA_ERROR:-0}" = 1 ]; then
+      echo 'column "journal_is_alarm" does not exist'; fi ;;
   'image inspect -f {{.Id}} inference:current') echo sha256:old-image ;;
   'compose stop inference') : ;;
   'compose start inference') [ "${MOCK_FAIL_START:-0}" != 1 ] ;;
@@ -54,7 +59,8 @@ esac
 
 
 def _run(tmp_path: Path, fail_copy: bool = False, fail_start: bool = False,
-         no_inference: bool = False) -> tuple[subprocess.CompletedProcess[str], Path]:
+         no_inference: bool = False, schema_error: bool = False
+         ) -> tuple[subprocess.CompletedProcess[str], Path]:
     bin_dir = _mock_tools(tmp_path)
     runtime = tmp_path / "runtime"
     runtime.mkdir()
@@ -77,6 +83,7 @@ def _run(tmp_path: Path, fail_copy: bool = False, fail_start: bool = False,
         "MOCK_FAIL_CP": "1" if fail_copy else "0",
         "MOCK_FAIL_START": "1" if fail_start else "0",
         "MOCK_NO_INFERENCE": "1" if no_inference else "0",
+        "MOCK_SCHEMA_ERROR": "1" if schema_error else "0",
     }
     result = subprocess.run(["bash", str(SCRIPT)], env=env, text=True,
                             capture_output=True, check=False)
@@ -125,3 +132,13 @@ def test_missing_equipment_service_blocks_image_switch(tmp_path: Path) -> None:
     assert result.returncode != 0
     assert "window cannot be preserved" in result.stderr
     assert not list((backup / "inference-windows").glob("equipment-*"))
+
+
+def test_known_schema_failure_still_preserves_window(tmp_path: Path) -> None:
+    result, backup = _run(tmp_path, schema_error=True)
+    assert result.returncode == 0, result.stderr
+    snapshot = next((backup / "inference-windows").glob("equipment-*"))
+    manifest = json.loads((snapshot / "manifest.json").read_text())
+    assert manifest["old_health"] == "starting"
+    assert manifest["schema_recovery"] is True
+    assert "compose start inference" in (tmp_path / "calls.log").read_text()
