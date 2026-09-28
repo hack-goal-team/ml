@@ -528,6 +528,10 @@ def compile_model_features(
             )
             continue
 
+        if feature == "hours_since_prev_target":
+            specs.append(FeatureSpec(kind="prev_target"))
+            continue
+
         specs.append(
             FeatureSpec(
                 kind="static",
@@ -1365,6 +1369,7 @@ class PredictionService:
         self,
         sensor_id: int,
         at: datetime,
+        hours_since_prev_target: float | None = None,
     ) -> list[Any]:
         if (
             sensor_id
@@ -1513,6 +1518,9 @@ class PredictionService:
                     at.isoweekday()
                 )
 
+            elif spec.kind == "prev_target":
+                value = hours_since_prev_target
+
             elif spec.kind == "one_hot":
                 source = metadata[spec.name]
                 value = int(
@@ -1559,6 +1567,7 @@ class PredictionService:
         row: list[Any],
         raw_prediction: float,
         horizon_hours: float,
+        top_n: int = 10,
     ) -> dict[str, Any]:
         started = (
             time.perf_counter()
@@ -1611,7 +1620,7 @@ class PredictionService:
                 )
             ),
             reverse=True,
-        )[:10]
+        )[:top_n]
 
         top = []
 
@@ -1790,6 +1799,9 @@ class PredictionService:
                 self._build_feature_row(
                     sensor_id=sensor_id,
                     at=timestamp,
+                    hours_since_prev_target=payload.get(
+                        "hours_since_prev_target"
+                    ),
                 )
             )
 
@@ -1874,6 +1886,7 @@ class PredictionService:
                         horizon_hours=(
                             horizon_hours
                         ),
+                        top_n=(11 if payload.get("_incident_report") else 10),
                     )
                 )
 

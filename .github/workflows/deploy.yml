@@ -21,7 +21,7 @@ jobs:
   deploy:
     needs: test
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 50
     env:
       IMAGE: inference:${{ github.sha }}
       REMOTE_DIR: backend
@@ -119,7 +119,7 @@ jobs:
 
           # Прогрев окон за 3 дня — минуты; ждём healthy, а не running.
           wait_healthy() {
-            local deadline=$((SECONDS + 900)) service id status
+            local deadline=$((SECONDS + 2100)) service id status
             for service in $services; do
               while :; do
                 id=$(sudo -n docker compose ps -q "$service")

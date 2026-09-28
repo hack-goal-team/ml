@@ -79,6 +79,10 @@ CREATE TABLE events (
 ) PARTITION BY RANGE (ts);
 CREATE TABLE events_default PARTITION OF events DEFAULT;
 
+CREATE TABLE alarm_backfill (finished_at timestamptz NOT NULL DEFAULT now());
+INSERT INTO alarm_backfill DEFAULT VALUES;
+GRANT SELECT ON alarm_backfill TO inference;
+
 CREATE TABLE reason_codes (
     code         text PRIMARY KEY,
     description  text NOT NULL

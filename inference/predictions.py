@@ -10,13 +10,12 @@ from typing import Any, Iterable, Mapping
 import psycopg
 from psycopg.types.json import Jsonb
 
-MODEL_VERSION_PREFIX = "catboost-aft-"
 SHAP_TOP = 10
 
 INSERT_PREDICTION = """
     INSERT INTO prediction_log (target_kind, target_ref, incident_type,
         probability, horizon_until, model_version, shap)
-    VALUES ('channel', %s, 'CHANNEL_EVENT', %s, %s, %s, %s)
+    VALUES ('channel', %s, %s, %s, %s, %s, %s)
 """
 
 # Только строки этой модели: мок и чужие версии не трогаем. Строки с
@@ -40,6 +39,7 @@ class PredictionRow:
     probability: Decimal
     horizon_until: datetime
     shap: dict[str, Any] | None
+    incident_type: str = "CHANNEL_EVENT"
 
 
 def to_probability(value: float) -> Decimal:
@@ -65,6 +65,7 @@ def _plain(value: Any) -> Any:
 def shap_contract(
     shap: Mapping[str, Any],
     cat_features: frozenset[str],
+    top_n: int = SHAP_TOP,
 ) -> dict[str, Any]:
     """Выход _explain → формат prediction_log.shap из 014.
 
@@ -75,7 +76,7 @@ def shap_contract(
         shap["top"],
         key=lambda item: abs(float(item["shap_raw"])),
         reverse=True,
-    )[:SHAP_TOP]
+    )[:top_n]
 
     items = []
     for item in top:
@@ -106,6 +107,7 @@ def write_predictions(
     params = [
         (
             str(row.channel_id),
+            row.incident_type,
             row.probability,
             row.horizon_until,
             model_version,
@@ -121,7 +123,10 @@ def write_predictions(
 def delete_expired(
     conn: psycopg.Connection,
     model_version: str,
+    prediction_kind: str = "EQUIPMENT",
 ) -> int:
+    prefix = ("incident4-v4-" if prediction_kind == "INCIDENT"
+              else "catboost-aft-")
     with conn.cursor() as cur:
-        cur.execute(DELETE_EXPIRED, (MODEL_VERSION_PREFIX, model_version))
+        cur.execute(DELETE_EXPIRED, (prefix, model_version))
         return cur.rowcount
