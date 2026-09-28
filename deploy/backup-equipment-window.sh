@@ -21,6 +21,16 @@ container=$(docker compose ps -q inference)
   echo 'equipment inference is not running' >&2
   exit 1
 }
+old_health=$(docker inspect -f '{{.State.Health.Status}}' "$container")
+schema_recovery=0
+old_logs=$(docker logs --tail 100 "$container" 2>&1)
+if grep -Fq 'column "journal_is_alarm" does not exist' <<<"$old_logs"; then
+  schema_recovery=1
+  echo 'old equipment is blocked by missing journal_is_alarm; preserving its window before repair'
+elif [[ $old_health != healthy ]]; then
+  echo "old equipment is not healthy: $old_health" >&2
+  exit 1
+fi
 image=$(docker image inspect -f '{{.Id}}' inference:current)
 [[ -n $image ]] || { echo 'inference:current image is missing' >&2; exit 1; }
 volume=$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/app/runtime"}}{{.Name}}{{end}}{{end}}' "$container")
@@ -43,7 +53,7 @@ cleanup() {
   local result=$?
   trap - EXIT
   if (( stopped )); then
-    if ! docker compose start inference || ! wait_healthy; then
+    if ! docker compose start inference || ! verify_old_running; then
       echo 'CRITICAL: old equipment inference did not recover after backup failure' >&2
       result=1
     fi
@@ -66,6 +76,14 @@ wait_healthy() {
     fi
     sleep 15
   done
+}
+
+verify_old_running() {
+  if (( schema_recovery )); then
+    [[ $(docker inspect -f '{{.State.Running}}' "$container") == true ]]
+  else
+    wait_healthy
+  fi
 }
 
 # Stop before copying the cursor so it matches a completed batch.
@@ -104,16 +122,16 @@ copy_query "SELECT id, event_id, channel_id, ts, raw_value, is_alarm FROM events
 copy_query "SELECT id, event_id, channel_id, ts, raw_value, is_alarm FROM events WHERE ts > '${snapshot_at}'::timestamptz" future_events.csv.gz
 copy_query 'SELECT channel_id, eng_system_type, sensor_type, system_tag, sensor_name, object_id FROM dim_channels_current' channels.csv.gz
 copy_query 'SELECT object_id, hierarchy_level, parent_id, object_kind, dispatcher_name FROM dim_objects_current' objects.csv.gz
-wait_healthy
+verify_old_running
 
-python3 - "$tmp" "$snapshot_at" "$image" "$sha" "$volume" <<'PY'
+python3 - "$tmp" "$snapshot_at" "$image" "$sha" "$volume" "$old_health" "$schema_recovery" <<'PY'
 import csv
 import gzip
 import json
 import sys
 from pathlib import Path
 
-directory, snapshot_at, image, sha, volume = sys.argv[1:]
+directory, snapshot_at, image, sha, volume, old_health, schema_recovery = sys.argv[1:]
 root = Path(directory)
 counts = {}
 for name in ('events', 'future_events', 'channels', 'objects'):
@@ -143,6 +161,8 @@ manifest = {
     'window_hours': 72,
     'image_id': image,
     'runtime_volume': volume,
+    'old_health': old_health,
+    'schema_recovery': schema_recovery == '1',
     'deploy_sha': sha,
     'cursor_low': data['low'],
     'cursor_seen': len(data['seen']),

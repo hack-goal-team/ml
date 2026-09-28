@@ -54,7 +54,7 @@ SELECT_WARMUP = """
 
 # Фильтр по ts отсекает старые партиции и импорт истории вне окон.
 SELECT_NEW = """
-    SELECT id, channel_id, ts, raw_value, is_alarm, journal_is_alarm FROM events
+    SELECT id, channel_id, ts, raw_value, is_alarm, {journal_alarm} FROM events
     WHERE ts >= %(since)s AND id > %(low)s
       AND id <> ALL(%(seen)s::bigint[])
     ORDER BY id
@@ -326,8 +326,11 @@ class Runner:
 
     def _fetch(self, conn: psycopg.Connection) -> list[EventRow]:
         assert self.cursor is not None
+        journal_alarm = (
+            "journal_is_alarm" if self.targets is not None else "NULL::boolean"
+        )
         rows = conn.execute(
-            SELECT_NEW,
+            SELECT_NEW.format(journal_alarm=journal_alarm),
             {
                 "since": self.clock() - self.window,
                 "low": self.cursor.low,

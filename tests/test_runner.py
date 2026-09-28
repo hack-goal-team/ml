@@ -139,6 +139,16 @@ def test_tick_writes_prediction_rows(db, make_runner) -> None:
     assert "null" not in [item["feature_value"] for item in shap["top"]]
 
 
+def test_equipment_reads_events_before_incident_migration(db, make_runner) -> None:
+    with db.admin() as admin:
+        admin.execute("ALTER TABLE events DROP COLUMN journal_is_alarm")
+    runner, conn = started(make_runner, db)
+    with db.admin() as admin:
+        add_event(admin, CHANNEL, datetime.now(timezone.utc), "Норма")
+    runner.tick(conn)
+    assert len(predictions(db)) == 1
+
+
 def test_shap_null_below_threshold(db, make_runner) -> None:
     runner, conn = started(make_runner, db, threshold=1.0)
 
