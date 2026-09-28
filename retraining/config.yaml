@@ -24,3 +24,6 @@ notebook_limits:
     train_chunks: 8
     val_chunks: 80
     test_chunks: 20
+  final_training:
+    train_chunks: all
+    val_chunks: all

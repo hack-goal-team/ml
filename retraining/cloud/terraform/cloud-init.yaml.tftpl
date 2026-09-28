@@ -1,0 +1,12 @@
+#cloud-config
+write_files:
+  - path: /etc/ml-job.json
+    permissions: '0600'
+    encoding: b64
+    content: ${config_b64}
+  - path: /usr/local/bin/ml-bootstrap.py
+    permissions: '0755'
+    encoding: b64
+    content: ${bootstrap_b64}
+runcmd:
+  - ['python3', '-u', '/usr/local/bin/ml-bootstrap.py']
