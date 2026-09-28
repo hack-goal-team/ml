@@ -26,6 +26,7 @@ RUN useradd --system --uid 10001 --no-create-home inference \
 COPY app.py config.yml ./
 COPY inference/ inference/
 COPY data/best_model.cbm data/best_model.cbm
+COPY data/feature_encoding.json data/feature_encoding.json
 
 USER inference
 VOLUME /app/runtime

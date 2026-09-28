@@ -33,7 +33,7 @@ class FakeClock:
 def add_channel(conn: psycopg.Connection, channel_id: int) -> None:
     conn.execute(
         "INSERT INTO dim_channels VALUES "
-        "(%s, %s, 'Охранная', 'КД АВ', '15-11.1.131.2.', 'КД АВ', 20)",
+        "(%s, %s, 'Охранная подсистема', 'КД АВ', '15-11.1.131.2.', 'КД АВ', 20)",
         (channel_id, SNAPSHOT),
     )
 

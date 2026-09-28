@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
 import pickle
@@ -393,6 +394,8 @@ WEATHER_RE = re.compile(
     r"(?P<horizon>current|\d+(?:\.\d+)?[hdm])$"
 )
 
+ENCODED_CATEGORY_RE = re.compile(r"^(?P<name>.+)__cat_(?P<index>\d+)$")
+
 
 def period_seconds(value: str) -> int:
     if value == "current":
@@ -416,6 +419,7 @@ class FeatureSpec:
     kind: str
     name: str | None = None
     seconds: int = 0
+    level: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -431,8 +435,10 @@ class CompiledModelFeatures:
 
 def compile_model_features(
     feature_names: Iterable[str],
+    category_levels: Mapping[str, list[str]] | None = None,
 ) -> CompiledModelFeatures:
     names = tuple(feature_names)
+    category_levels = category_levels or {}
     specs: list[FeatureSpec] = []
     rolling_windows: set[int] = set()
     categories_by_window: dict[int, set[str]] = {}
@@ -441,6 +447,18 @@ def compile_model_features(
     weather_offsets_seconds: set[int] = set()
 
     for feature in names:
+        encoded_match = ENCODED_CATEGORY_RE.match(feature)
+        if encoded_match:
+            name = encoded_match.group("name")
+            index = int(encoded_match.group("index"))
+            levels = category_levels.get(name)
+            if levels is None or index >= len(levels):
+                raise ValueError(f"No encoding for model feature {feature!r}")
+            specs.append(FeatureSpec(kind="one_hot", name=name, level=levels[index]))
+            if name not in static_features:
+                static_features.append(name)
+            continue
+
         cat_match = CAT_RE.match(feature)
 
         if cat_match:
@@ -1201,9 +1219,26 @@ class PredictionService:
             self.model.feature_names_
         )
 
+        encoding_path = config.model_path.with_name("feature_encoding.json")
+        category_levels: dict[str, list[str]] = {}
+        if encoding_path.exists():
+            encoding = json.loads(encoding_path.read_text(encoding="utf-8"))
+            category_levels = encoding["levels"]
+            expected: list[str] = []
+            for name in encoding["features"]:
+                if name in category_levels:
+                    expected.extend(
+                        f"{name}__cat_{index}"
+                        for index in range(len(category_levels[name]))
+                    )
+                else:
+                    expected.append(name)
+            if tuple(expected) != self.feature_names:
+                raise ValueError("Feature encoding does not match the model")
+
         self.compiled = (
             compile_model_features(
-                self.feature_names
+                self.feature_names, category_levels
             )
         )
 
@@ -1476,6 +1511,12 @@ class PredictionService:
             elif spec.kind == "day_of_week":
                 value = (
                     at.isoweekday()
+                )
+
+            elif spec.kind == "one_hot":
+                source = metadata[spec.name]
+                value = int(
+                    ("null" if source is None else str(source)) == spec.level
                 )
 
             else:

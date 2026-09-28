@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -36,7 +37,8 @@ def _row(valid_for, is_forecast, temperature=Decimal("12.40")):
 def test_keys_are_exactly_model_weather_features() -> None:
     model = CatBoostRegressor()
     model.load_model(str(DATA / "best_model.cbm"))
-    compiled = compile_model_features(model.feature_names_)
+    levels = json.loads((DATA / "feature_encoding.json").read_text(encoding="utf-8"))["levels"]
+    compiled = compile_model_features(model.feature_names_, levels)
 
     expected = {spec.name for spec in compiled.specs if spec.kind == "weather"}
 

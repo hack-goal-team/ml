@@ -767,12 +767,16 @@ Env (default): `INFERENCE_RUNTIME_DIR` (`runtime`, volume), `POLL_INTERVAL_SECON
 
 Образ: `python:3.11-slim`, `CMD python -m inference.runner`, `HEALTHCHECK python -m inference.health` (прогрев до 10 мин). Volume `/app/runtime` хранит курсор, без него рестарт теряет логи за простой.
 
+Модель `full-no2021-20260927` хранится в `data/best_model.cbm`. Рядом лежит `data/feature_encoding.json`: при запуске сервис сверяет порядок всех 105 входов с моделью и по значению `тип_инж_системы` из `dim_channels_current` рассчитывает семь числовых индикаторов. При отсутствии файла или расхождении схем сервис не стартует.
+
 ```bash
 docker build -t inference:local .
 docker run --rm -v inference-runtime:/app/runtime -e PGHOST=... -e PGUSER=inference -e PGPASSWORD=... inference:local
 ```
 
-CI (`ci.yml`): `pytest` со встроенным Postgres, `docker build`, smoke образа. Деплой (`deploy.yml`, push в `main` или вручную): после CI образ едет на VPS по SSH как `inference:current`, хранятся текущий и один предыдущий `inference:<sha>` для отката. Если в compose бэкенда есть сервис `inference`, он перезапускается и деплой ждёт `healthy`. Секреты: `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`.
+CI (`ci.yml`): `pytest` на Python 3.12 x86_64 со встроенным Postgres, `docker build`, smoke образа. Деплой (`deploy.yml`, push в `main` или вручную): после CI образ едет на VPS по SSH как `inference:current`, хранятся текущий и один предыдущий `inference:<sha>` для отката. Перед переключением сохраняются предыдущая модель, курсор и события за 72 часа в `~/backend/model-backups/before-full-no2021/` вместе с SHA-256; прежний образ получает тег `inference:rollback-before-full-no2021`. Новая версия прогревает окно из `events`, не из файла старой модели. При отказе healthcheck сценарий возвращает старый образ. Секреты: `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`.
+
+Ручной откат на VPS: `sudo docker tag inference:rollback-before-full-no2021 inference:current`, затем из `~/backend` выполнить `sudo docker compose up -d --no-deps inference` и дождаться `healthy`. Снимок событий нужен для разбора и возможной конвертации состояния; штатный прогрев читает события непосредственно из PostgreSQL.
 
 Тесты: SQL-часть поднимает встроенный Postgres (`pgserver`) без Docker. Если пакета нет, эти тесты пропускаются.
 

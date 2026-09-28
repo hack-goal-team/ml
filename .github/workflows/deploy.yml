@@ -74,6 +74,59 @@ jobs:
           set -o pipefail
           docker save "$IMAGE" | gzip | ssh vps 'gunzip | sudo -n docker load'
 
+      - name: Preserve current model and 72-hour history
+        run: |
+          ssh vps "REMOTE_DIR=$REMOTE_DIR bash -s" <<'EOF'
+          set -euo pipefail
+          cd "$HOME/$REMOTE_DIR"
+          backup="$HOME/$REMOTE_DIR/model-backups/before-full-no2021"
+          umask 077
+          mkdir -p "$backup"
+          if [ -f "$backup/SHA256SUMS" ]; then
+            echo "existing model-switch backup verified"
+            cd "$backup"
+            sha256sum -c SHA256SUMS
+            exit 0
+          fi
+
+          sudo -n docker image inspect inference:current >/dev/null
+          sudo -n docker tag inference:current inference:rollback-before-full-no2021
+          sudo -n docker image inspect -f '{{.Id}}' inference:current > "$backup/previous-image-id.txt"
+
+          container=$(sudo -n docker compose ps -q inference)
+          created=0
+          if [ -z "$container" ]; then
+            container=$(sudo -n docker create inference:current)
+            created=1
+          fi
+          sudo -n docker cp "$container:/app/data/best_model.cbm" "$backup/previous_model.cbm.tmp"
+          if [ "$created" -eq 0 ]; then
+            sudo -n docker cp "$container:/app/runtime/events_cursor.json" "$backup/events_cursor.json.tmp"
+          else
+            sudo -n docker rm "$container" >/dev/null
+          fi
+          sudo -n chown "$USER" "$backup"/*.tmp
+          mv "$backup/previous_model.cbm.tmp" "$backup/previous_model.cbm"
+          if [ -f "$backup/events_cursor.json.tmp" ]; then
+            mv "$backup/events_cursor.json.tmp" "$backup/events_cursor.json"
+          fi
+
+          db=$(sed -n 's/^POSTGRES_DB=//p' .env)
+          dbuser=$(sed -n 's/^POSTGRES_USER=//p' .env)
+          sudo -n docker compose exec -T postgres psql -X -q -v ON_ERROR_STOP=1 \
+            -U "$dbuser" -d "$db" -c \
+            "COPY (SELECT id, event_id, channel_id, ts, is_alarm, raw_value FROM events WHERE ts >= now() - interval '72 hours' ORDER BY ts, id) TO STDOUT WITH (FORMAT csv, HEADER true)" \
+            | gzip -c > "$backup/events-72h.csv.gz.tmp"
+          mv "$backup/events-72h.csv.gz.tmp" "$backup/events-72h.csv.gz"
+          cd "$backup"
+          sha256sum previous_model.cbm previous-image-id.txt events-72h.csv.gz \
+            > SHA256SUMS
+          if [ -f events_cursor.json ]; then
+            sha256sum events_cursor.json >> SHA256SUMS
+          fi
+          sha256sum -c SHA256SUMS
+          EOF
+
       # Стабильный тег, а не переменная в .env: деплой бэкенда переписывает
       # ~/backend/.env целиком.
       - name: Tag current
@@ -101,7 +154,25 @@ jobs:
             echo "::notice::backend compose has no 'inference' service yet (HACK-136): image loaded, not started"
             exit 0
           fi
-          sudo -n docker compose up -d --no-deps inference
+          rollback() {
+            echo "::error::new inference failed; restoring previous image"
+            sudo -n docker tag inference:rollback-before-full-no2021 inference:current
+            sudo -n docker compose up -d --no-deps --force-recreate inference
+            rollback_deadline=$((SECONDS + 900))
+            while :; do
+              rollback_id=$(sudo -n docker compose ps -q inference)
+              rollback_status=$(sudo -n docker inspect -f '{{.State.Health.Status}}' "$rollback_id" 2>/dev/null || echo missing)
+              echo "rollback inference: $rollback_status"
+              [ "$rollback_status" = healthy ] && return 0
+              [ $SECONDS -ge $rollback_deadline ] && return 1
+              sleep 15
+            done
+          }
+
+          if ! sudo -n docker compose up -d --no-deps --force-recreate inference; then
+            rollback
+            exit 1
+          fi
 
           # Прогрев окон за 3 дня — минуты; ждём healthy, а не running.
           deadline=$((SECONDS + 900))
@@ -112,7 +183,8 @@ jobs:
             [ "$status" = healthy ] && break
             if [ "$status" = unhealthy ] || [ $SECONDS -ge $deadline ]; then
               echo "::error::inference is not healthy ($status)"
-              sudo -n docker compose logs --tail 200 inference
+              sudo -n docker compose logs --tail 200 inference || true
+              rollback
               exit 1
             fi
             sleep 15
@@ -127,7 +199,7 @@ jobs:
           ssh vps "SHA=${{ github.sha }} bash -s" <<'EOF'
           set -euo pipefail
           sudo -n docker image ls inference --format '{{.CreatedAt}}\t{{.Tag}}' \
-            | { grep -vP "\t(current|$SHA)\$" || true; } | sort -r | tail -n +2 | cut -f2 \
+            | { grep -vP "\t(current|$SHA|rollback-before-full-no2021)\$" || true; } | sort -r | tail -n +2 | cut -f2 \
             | while read -r tag; do sudo -n docker image rm "inference:$tag" >/dev/null || true; done
           sudo -n docker image prune -f >/dev/null
           EOF

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -19,6 +20,9 @@ from inference.reference import (
 DATA = Path(__file__).resolve().parent.parent / "data"
 SENSORS = DATA / "справочник_каналов_датчиков.parquet"
 OBJECTS = DATA / "справочник_объектов_диспетчер.parquet"
+ENCODING_LEVELS = json.loads(
+    (DATA / "feature_encoding.json").read_text(encoding="utf-8")
+)["levels"]
 
 # Все колонки справочников, которые можно сделать фичей, кроме ID.
 ALL_FEATURES = [
@@ -37,7 +41,7 @@ def model_features() -> tuple[str, ...]:
 
 def _parquet_metadata(features, sensors=SENSORS, objects=OBJECTS):
     return _build_metadata(
-        compile_model_features(features),
+        compile_model_features(features, ENCODING_LEVELS),
         ServiceConfig(
             sensors_metadata_path=sensors,
             objects_metadata_path=objects,
@@ -70,17 +74,16 @@ def _assert_identical(actual, expected) -> None:
 
 
 def test_model_static_features_are_known(model_features) -> None:
-    compiled = compile_model_features(model_features)
+    compiled = compile_model_features(model_features, ENCODING_LEVELS)
 
     assert compiled.static_features == (
-        "тип_датчика",
-        "тег_инженерной_системы",
+        "тип_инж_системы",
         "родитель",
     )
 
 
 def test_equivalent_to_parquet_for_model(model_features) -> None:
-    static = compile_model_features(model_features).static_features
+    static = compile_model_features(model_features, ENCODING_LEVELS).static_features
     expected = _parquet_metadata(model_features)
     channels, objects = _registry_rows()
 
@@ -174,13 +177,13 @@ def test_fetch_from_postgres_takes_latest_snapshot(pg, model_features) -> None:
         _copy(conn, "dim_channels", new, channels)
         _copy(conn, "dim_objects", new, objects)
 
-    compiled = compile_model_features(model_features)
+    compiled = compile_model_features(model_features, ENCODING_LEVELS)
     expected = _parquet_metadata(model_features)
 
     with pg.inference() as conn:
         actual = fetch_metadata(conn, compiled.static_features)
 
     # Как view dim_channels_current: канал из прошлой версии не пропадает.
-    assert actual.pop(424242)["тег_инженерной_системы"] == "9"
+    assert actual.pop(424242)["тип_инж_системы"] == gone["eng_system_type"]
     _assert_identical(actual, expected)
     assert len(metadata_loader(pg.inference)(compiled)) == len(expected) + 1
